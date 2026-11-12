@@ -23,6 +23,9 @@ def hook(src,dst):
 hook('BattleGenerateHit','ParryBattleGenerateHit')
 hook('DoCombatAction','ParryDoCombatAction')
 hook('AiStartCombatAction','ParryAiStartCombatAction')
+hook('BeginBattleAnimations','ParryBeginBattleAnimations')
+hook('EkrBattleTriggerNewRoundStart','ParryEkrTriggerNewRoundStart')
+hook('EkrBattleInRound','ParryEkrBattleInRound')
 # fix header checksum
 c=0
 for i in range(0xA0,0xBD): c=(c-b[i])&0xFF

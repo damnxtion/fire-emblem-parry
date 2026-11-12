@@ -21,6 +21,12 @@
 #include "ai_decide.h"
 #include "item.h"
 #include "mu.h"
+#include "manim.h"
+#include "map.h"
+#include "banim.h"
+#include "banim_sprite.h"
+#include "banim_ekrbattle.h"
+#include "arena.h"
 
 #include "hack_parry_str.h"
 
@@ -134,6 +140,23 @@ struct ParryProc
     /* 5A */ u8 next_ev;
     /* 5B */ u8 flash;
     /* 5C */ u8 shown_res;
+    /* 5D */ u8 mode;
+    /* 5E */ u8 in_scene;    // QTE is being shown inside the battle scene
+    /* 5F */ u8 shown;       // hits already played in the battle scene
+    /* 60 */ u8 total;       // hits in the latest generation pass
+    /* 61 */ u8 pending_hit; // hit index of the pending (undecided) enemy strike
+    /* 62 */ u8 seg_ready;   // the current scene segment has been prepared
+    /* 63 */ u8 final_done;  // the final (real) generation pass has run
+    /* 64 */ u16 saved_bldcnt;
+    /* 66 */ u8 saved_coef_a, saved_coef_b, saved_y;
+};
+
+enum
+{
+    MODE_PENDING, // decisions pending, waiting to know how the battle is shown
+    MODE_MAP,     // QTE runs on the map before map animations
+    MODE_SCENE,   // QTE runs inside the battle scene before each enemy strike
+    MODE_DONE,    // all decided; waiting for the combat action to finish
 };
 
 static void Parry_Loop(struct ParryProc * proc);
@@ -187,6 +210,9 @@ static void GenerateBattle(struct ParryProc * proc, bool real)
     SetBattleUnitTerrainBonusesAuto(&gBattleUnitB);
 
     BattleGenerate(proc->instigator, proc->target);
+
+    BattleUnitTargetCheckCanCounter(&gBattleUnitB);
+    BattleUnitTargetSetEquippedWeapon(&gBattleUnitB);
 }
 
 // Runs a full generation pass with the decisions known so far.
@@ -202,6 +228,23 @@ static void RunPass(struct ParryProc * proc, bool real)
     GenerateBattle(proc, real);
 
     proc->generating = FALSE;
+    proc->total = gBattleHitIt - gBattleHits;
+
+    if (real)
+        proc->final_done = TRUE;
+}
+
+// After a decision: re-run the prediction; if nothing is left to decide,
+// run the final (real) pass that also computes exp / level ups.
+static void Regenerate(struct ParryProc * proc)
+{
+    RunPass(proc, FALSE);
+
+    if (!proc->pending || proc->n_done >= MAX_STRIKES)
+    {
+        proc->pending = FALSE;
+        RunPass(proc, TRUE);
+    }
 }
 
 static bool IsPlayerSide(struct Unit * unit)
@@ -265,6 +308,7 @@ bool ParryBattleGenerateHit(struct BattleUnit * attacker, struct BattleUnit * de
             else if (idx == proc->n_done && !proc->pending)
             {
                 proc->pending = TRUE;
+                proc->pending_hit = gBattleHitIt - gBattleHits;
                 proc->pending_boss = ((UNIT_ATTRIBUTES(&attacker->unit) & UNIT_ATTR_BOSS) || gParryConfig.all_boss) ? TRUE : FALSE;
             }
         }
@@ -305,8 +349,13 @@ bool ParryBattleGenerateHit(struct BattleUnit * attacker, struct BattleUnit * de
 // ---------------------------------------------------------------------------
 // presentation
 
+static bool sInScene(void);
+
 static void DrawBanner(char const * line1, char const * line2)
 {
+    if (sInScene())
+        return;
+
     TmFill(gBg0Tm, 0);
     TmFill(gBg1Tm, 0);
 
@@ -329,6 +378,9 @@ static void DrawBanner(char const * line1, char const * line2)
 
 static void ClearBanner(void)
 {
+    if (sInScene())
+        return;
+
     TmFill(gBg0Tm, 0);
     TmFill(gBg1Tm, 0);
     EnableBgSync(BG0_SYNC_BIT | BG1_SYNC_BIT);
@@ -338,12 +390,34 @@ static void SetMapTint(int effect, int amount)
 {
     if (effect == BLEND_EFFECT_NONE)
     {
+        if (sInScene())
+        {
+            struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+
+            *((u16 *) &gDispIo.blend_ct) = proc->saved_bldcnt;
+            gDispIo.blend_coef_a = proc->saved_coef_a;
+            gDispIo.blend_coef_b = proc->saved_coef_b;
+            gDispIo.blend_y = proc->saved_y;
+            return;
+        }
+
         SetBlendNone();
         return;
     }
 
     SetBlendConfig(effect, 0, 0, amount);
-    SetBlendTargetA(0, 0, 1, 1, 1);
+
+    if (sInScene())
+    {
+        // whole battle screen
+        SetBlendTargetA(1, 1, 1, 1, 1);
+        gDispIo.blend_ct.target1_enable_bd = TRUE;
+    }
+    else
+    {
+        SetBlendTargetA(0, 0, 1, 1, 1);
+    }
+
     SetBlendTargetB(0, 0, 0, 0, 0);
 }
 
@@ -352,6 +426,9 @@ static void PutHitPips(struct ParryProc * proc)
     // small row of markers: one per impact of the pattern
     int i;
     u16 * tm = gBg0Tm + TM_OFFSET(22, 4);
+
+    if (proc->in_scene)
+        return;
 
     for (i = 0; i < proc->hit_count && i < MAX_HITS; ++i)
     {
@@ -506,28 +583,18 @@ static void FinishStrike(struct ParryProc * proc)
     proc->state = ST_RESULT;
 }
 
-static void Parry_Loop(struct ParryProc * proc)
+static bool sInScene(void)
+{
+    struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+    return proc != NULL && proc->in_scene;
+}
+
+// Runs one frame of the timing challenge. Returns TRUE once the strike
+// (and its result display) is complete and the decision has been recorded.
+static bool QteStep(struct ParryProc * proc)
 {
     switch (proc->state)
     {
-
-    case ST_PREDICT:
-        if (proc->n_done >= MAX_STRIKES)
-        {
-            proc->state = ST_FINISH;
-            break;
-        }
-
-        RunPass(proc, FALSE);
-
-        if (!proc->pending)
-        {
-            proc->state = ST_FINISH;
-            break;
-        }
-
-        StartStrike(proc);
-        break;
 
     case ST_PLAY:
     {
@@ -601,29 +668,118 @@ static void Parry_Loop(struct ParryProc * proc)
         if (FirstUnresolvedHit(proc) < 0 && proc->flash == 0)
             FinishStrike(proc);
 
-        break;
+        return FALSE;
     }
 
     case ST_RESULT:
         if (proc->result_clock != 0)
         {
             proc->result_clock--;
-            break;
+
+            // in battle: show the verdict as a short colour pulse
+            if (proc->in_scene && proc->result_clock == 30)
+            {
+                if (proc->shown_res == RES_FAIL)
+                    SetMapTint(BLEND_EFFECT_DARKEN, 8);
+                else
+                    SetMapTint(BLEND_EFFECT_BRIGHTEN, proc->shown_res == RES_PARRY ? 12 : 6);
+            }
+
+            if (proc->in_scene && proc->result_clock == 20)
+                SetMapTint(BLEND_EFFECT_NONE, 0);
+
+            return FALSE;
         }
 
         SetMapTint(BLEND_EFFECT_NONE, 0);
         ClearBanner();
-        proc->state = ST_PREDICT;
+        return TRUE;
+
+    }
+
+    return TRUE;
+}
+
+static void BeginQte(struct ParryProc * proc, bool in_scene)
+{
+    proc->in_scene = in_scene;
+
+    if (in_scene)
+    {
+        proc->saved_bldcnt = *((u16 *) &gDispIo.blend_ct);
+        proc->saved_coef_a = gDispIo.blend_coef_a;
+        proc->saved_coef_b = gDispIo.blend_coef_b;
+        proc->saved_y = gDispIo.blend_y;
+    }
+
+    StartStrike(proc);
+}
+
+// ---------------------------------------------------------------------------
+// map-animation path: a small proc that blocks the combat action while the
+// timing challenges run on the map
+
+static void MapWaiter_Loop(ProcPtr waiter);
+
+struct ProcScr CONST_DATA ProcScr_ParryMapWaiter[] =
+{
+    PROC_NAME("ReflexDefenseWait"),
+    PROC_REPEAT(MapWaiter_Loop),
+    PROC_END,
+};
+
+static void MapWaiter_Loop(ProcPtr waiter)
+{
+    struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+
+    if (proc != NULL && proc->mode == MODE_MAP)
+        return;
+
+    // decisions are final: start the map battle animation as usual
+    EndAllMus();
+    RenderMap();
+
+    StartBattleManim();
+
+    gBattleSt.flags |= BATTLE_FLAG_MAPANIMS;
+
+    Proc_End(waiter);
+}
+
+static void Parry_Loop(struct ParryProc * proc)
+{
+    switch (proc->mode)
+    {
+
+    case MODE_MAP:
+        if (proc->state == ST_PREDICT)
+        {
+            if (!proc->pending)
+            {
+                if (!proc->final_done)
+                    RunPass(proc, TRUE);
+
+                proc->mode = MODE_DONE;
+                break;
+            }
+
+            BeginQte(proc, FALSE);
+            break;
+        }
+
+        if (QteStep(proc))
+        {
+            Regenerate(proc);
+            proc->state = ST_PREDICT;
+        }
+
         break;
 
-    case ST_FINISH:
-        SetMapTint(BLEND_EFFECT_NONE, 0);
-        ClearBanner();
+    default:
+        // stay alive while the combat action runs (holds scene state)
+        if (FindProc(ProcScr_CombatAction) == NULL)
+            Proc_End(proc);
 
-        RunPass(proc, TRUE);
-
-        SpawnProcLocking(ProcScr_CombatAction, proc->parent);
-        Proc_End(proc);
         break;
 
     }
@@ -632,6 +788,7 @@ static void Parry_Loop(struct ParryProc * proc)
 static void Parry_OnEnd(struct ParryProc * proc)
 {
     proc->generating = FALSE;
+    proc->in_scene = FALSE;
 }
 
 static void StartParry(ProcPtr parent, struct Unit * instigator, struct Unit * target, bool ballista)
@@ -640,8 +797,13 @@ static void StartParry(ProcPtr parent, struct Unit * instigator, struct Unit * t
     int i;
 
     proc->state = ST_PREDICT;
+    proc->mode = MODE_PENDING;
     proc->generating = FALSE;
+    proc->in_scene = FALSE;
     proc->n_done = 0;
+    proc->shown = 0;
+    proc->seg_ready = FALSE;
+    proc->final_done = FALSE;
     proc->parent = parent;
     proc->instigator = instigator;
     proc->target = target;
@@ -651,6 +813,247 @@ static void StartParry(ProcPtr parent, struct Unit * instigator, struct Unit * t
         proc->results[i] = RES_NONE;
 
     RandGetSt(proc->rand_st);
+
+    // first prediction; if the enemy never strikes, resolve immediately
+    RunPass(proc, FALSE);
+
+    if (!proc->pending)
+    {
+        RunPass(proc, TRUE);
+        proc->mode = MODE_DONE;
+    }
+
+    SpawnProcLocking(ProcScr_CombatAction, parent);
+}
+
+// ---------------------------------------------------------------------------
+// hook: replaces BeginBattleAnimations
+
+void ParryBeginBattleAnimations(void)
+{
+    struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+
+    TmFill(gBg2Tm, 0);
+    EnableBgSync(BG2_SYNC_BIT);
+    SetBackdropColor(0);
+
+    RenderMap();
+
+    if (PrepareBattleGraphicsMaybe_())
+    {
+        if (proc != NULL && proc->mode == MODE_PENDING)
+            proc->mode = MODE_SCENE;
+
+        SetBanimLinkArenaFlag(0);
+        BeginAnimsOnBattleAnimations();
+        return;
+    }
+
+    if (proc != NULL && proc->mode == MODE_PENDING)
+    {
+        struct ProcScr const * combat = ProcScr_CombatAction;
+        ProcPtr action = FindProc(combat);
+
+        proc->mode = MODE_MAP;
+        proc->state = ST_PREDICT;
+
+        if (action != NULL)
+        {
+            SpawnProcLocking(ProcScr_ParryMapWaiter, action);
+            return;
+        }
+    }
+
+    EndAllMus();
+    RenderMap();
+
+    StartBattleManim();
+
+    gBattleSt.flags |= BATTLE_FLAG_MAPANIMS;
+}
+
+// ---------------------------------------------------------------------------
+// battle scene: segment playback
+
+// Keep only hits [shown, end) of the latest generation in gBattleHits and
+// rebuild the battle animation script from them (same as the arena does).
+static void PrepareSegment(struct ParryProc * proc)
+{
+    int end = proc->pending ? proc->pending_hit : proc->total;
+    int i, n = end - proc->shown;
+
+    for (i = 0; i < n; ++i)
+        gBattleHits[i] = gBattleHits[proc->shown + i];
+
+    gBattleHits[n].attributes = 0;
+    gBattleHits[n].info = BATTLE_HIT_INFO_END;
+    gBattleHits[n].damage = 0;
+
+    proc->shown = end;
+    proc->seg_ready = TRUE;
+
+    ParseBattleHitToBanimCmd();
+    BasInit();
+    UpdateBanimFrame();
+    InitMainAnims();
+}
+
+static void ParryEkrQte(struct ProcEkrBattle * ekr);
+
+static void TriggerRoundStartBody(struct ProcEkrBattle * proc)
+{
+    struct BaSprite * anim;
+
+    if (++proc->timer <= 0x1E)
+        return;
+
+    if (gEkrPairSideVaild[POS_L] == TRUE)
+    {
+        anim = MAIN_ANIM_FRONT(POS_L);
+        anim->flags3 = ANIM_BIT3_NEW_ROUND_START;
+        anim->flags2 |= ANIM_BIT2_STOP;
+
+        anim = MAIN_ANIM_BACK(POS_L);
+        anim->flags3 = ANIM_BIT3_NEW_ROUND_START;
+        anim->flags2 |= ANIM_BIT2_STOP;
+    }
+
+    if (gEkrPairSideVaild[POS_R] == TRUE)
+    {
+        anim = MAIN_ANIM_FRONT(POS_R);
+        anim->flags3 = ANIM_BIT3_NEW_ROUND_START;
+        anim->flags2 |= ANIM_BIT2_STOP;
+
+        anim = MAIN_ANIM_BACK(POS_R);
+        anim->flags3 = ANIM_BIT3_NEW_ROUND_START;
+        anim->flags2 |= ANIM_BIT2_STOP;
+    }
+
+    gBanimDoneFlag[POS_L] = FALSE;
+    gBanimDoneFlag[POS_R] = FALSE;
+    proc->proc_repeat_func = (ProcFunc)EkrBattleReleaseStandingAnim;
+}
+
+// hook: replaces EkrBattleTriggerNewRoundStart
+void ParryEkrTriggerNewRoundStart(struct ProcEkrBattle * ekr)
+{
+    struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+
+    if (proc != NULL && proc->mode == MODE_SCENE && !proc->seg_ready)
+    {
+        if (proc->pending && proc->pending_hit == proc->shown)
+        {
+            // the next thing to happen is an undecided enemy strike:
+            // play the timing challenge right here in the battle
+            BeginQte(proc, TRUE);
+            ekr->proc_repeat_func = (ProcFunc) ParryEkrQte;
+            return;
+        }
+
+        PrepareSegment(proc);
+    }
+
+    TriggerRoundStartBody(ekr);
+}
+
+static void ParryEkrQte(struct ProcEkrBattle * ekr)
+{
+    struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+
+    if (proc == NULL)
+    {
+        ekr->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
+        return;
+    }
+
+    if (!QteStep(proc))
+        return;
+
+    proc->in_scene = FALSE;
+    Regenerate(proc);
+
+    ekr->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
+}
+
+// hook: replaces EkrBattleInRound
+void ParryEkrBattleInRound(struct ProcEkrBattle * proc)
+{
+    struct ParryProc * pp = FindProc(ProcScr_ParryQte);
+    int ret = 0;
+
+    if (gKeySt->held & KEY_BUTTON_B)
+        proc->speedup = TRUE;
+
+    switch (gEkrDistanceType) {
+    case EKR_DISTANCE_CLOSE:
+    case EKR_DISTANCE_FAR:
+    case EKR_DISTANCE_FARFAR:
+        if ((gBanimDoneFlag[0] + gBanimDoneFlag[1]) == 2)
+        {
+            if (GetBattleAnimArenaFlag() == FALSE)
+            {
+                ret = 1;
+            }
+            else
+            {
+                gEkrPairExpGain[0] = gpEkrBattleUnitLeft->exp_gain;
+                gEkrPairExpGain[1] = gpEkrBattleUnitRight->exp_gain;
+
+                if (gEkrGaugeHp[POS_L] == 0)
+                {
+                    ArenaSetResult(1);
+                    ret = 1;
+                }
+                else if (gEkrGaugeHp[POS_R] == 0)
+                {
+                    ArenaSetResult(2);
+                    gEkrPairExpGain[POS_R] = 0;
+                    ret = 1;
+                }
+                else if (proc->speedup == TRUE)
+                {
+                    func_fe6_0804C56C();
+                    ArenaSetResult(4);
+                    gEkrPairExpGain[POS_R] = 0;
+                    ret = 1;
+                }
+                else
+                {
+                    ArenaContinueBattle();
+                    ParseBattleHitToBanimCmd();
+                    BasInit();
+                    UpdateBanimFrame();
+                    InitMainAnims();
+
+                    proc->timer = 0;
+                    proc->proc_repeat_func = (ProcFunc)EkrBattleTriggerNewRoundStart;
+                }
+            }
+        }
+        break;
+
+    case EKR_DISTANCE_MONOCOMBAT:
+        if ((gBanimDoneFlag[0] + gBanimDoneFlag[1]) == 1)
+            ret = 1;
+        break;
+
+    case EKR_DISTANCE_PROMOTION:
+        ret = 1;
+        break;
+    }
+
+    if (ret == 1 && pp != NULL && pp->mode == MODE_SCENE && pp->shown < pp->total
+        && gEkrDistanceType != EKR_DISTANCE_PROMOTION)
+    {
+        // more of this battle remains: next segment
+        pp->seg_ready = FALSE;
+        proc->timer = 0;
+        proc->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
+        return;
+    }
+
+    if (ret == 1)
+        proc->proc_repeat_func = (ProcFunc)EkrBattleTriggerEnding;
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +1073,7 @@ bool ParryDoCombatAction(ProcPtr proc)
         StartParry(proc, instigator, target, ballista);
         return FALSE;
     }
+
 
     if (ballista)
         BattleGenerateBallistaReal(instigator, target);

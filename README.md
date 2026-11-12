@@ -2,8 +2,13 @@
 
 A real-time dodge/parry system for FE6 (Japanese ROM `AFEJ` with the English fan translation).
 
-When an enemy is about to hit one of your units, a short timing challenge plays on the map:
-cue beats, a wind-up sound, then a white flash on impact.
+When an enemy is about to hit one of your units, a short timing challenge plays: cue beats,
+a wind-up sound, then a white flash on impact.
+
+- **Battle animations on:** the challenge happens inside the battle scene, right before each enemy
+  swing. The fight pauses with both fighters on screen, you time your press, and the swing then plays
+  out with the result (a parried or dodged blow shows as MISS!).
+- **Battle animations off:** the challenge plays on the map, with a text box, before the map battle.
 
 - **A on the flash — Parry:** the hit misses, and your next strike in that fight can't miss and deals about 50% more damage.
 - **B on the flash — Dodge:** the hit misses (wider window than parry).
