@@ -1,0 +1,40 @@
+diff --git a/Makefile b/Makefile
+index 56422a7..de48379 100644
+--- a/Makefile
++++ b/Makefile
+@@ -131,7 +131,7 @@ endif
+ # = CFLAGS overrides =
+ # ======================
+ 
+-%/main.o:           CFLAGS += -mtpcs-frame
++#%/main.o:           CFLAGS += -mtpcs-frame
+ 
+ %/irq.o:            CFLAGS += -O0
+ %/random.o:         CFLAGS += -O0
+diff --git a/fe6.lds b/fe6.lds
+index 1c2469b..aff40da 100644
+--- a/fe6.lds
++++ b/fe6.lds
+@@ -450,6 +450,7 @@ SECTIONS
+         asm/arm.o(.text);
+ 
+         src/main.o(.text);
++        . = . + 0x2C;
+         src/irq.o(.text);
+         src/random.o(.text);
+         src/hardware.o(.text);
+@@ -730,6 +731,14 @@ SECTIONS
+         . = 0x800000; /* end */
+     } = 0
+ 
++    .hack 0x08F00000 :
++    {
++        src/hack_parry.o(.hackcfg);
++        . = ALIGN(4); src/hack_parry.o(.text);
++        . = ALIGN(4); src/hack_parry.o(.rodata);
++        . = ALIGN(4); src/hack_parry.o(.data);
++    } = 0
++
+     /* DWARF 2 sections */
+     .debug_aranges  0 : { *(.debug_aranges) }
+     .debug_pubnames 0 : { *(.debug_pubnames) }
