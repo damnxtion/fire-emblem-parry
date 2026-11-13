@@ -33,6 +33,7 @@
 #include "gba/gba.h"
 
 #include "hack_parry_str.h"
+#include "hack_parry_gfx.h"
 
 // ---- external (non-header) game symbols ----
 extern struct ProcScr CONST_DATA ProcScr_CombatAction[];
@@ -109,6 +110,7 @@ static CONST_DATA struct PatternEv * CONST_DATA BossPatterns[] =
 #define BOSS_PATTERN_COUNT 6
 #define MAX_STRIKES 8
 #define MAX_HITS 6
+#define BATTLE_HIT_MAX_COUNT 7 // size of gBattleHits
 
 enum { RES_NONE, RES_FAIL, RES_DODGE, RES_PARRY };
 
@@ -284,9 +286,53 @@ bool ParryShouldRun(struct Unit * a, struct Unit * b)
 // ---------------------------------------------------------------------------
 // hook: replaces BattleGenerateHit
 
+static int HitsPerRound(struct BattleUnit * unit)
+{
+    if (!unit->weapon)
+        return 0;
+
+    return (unit->weapon_attributes & ITEM_ATTR_BRAVE) ? 2 : 1;
+}
+
+// Upper bound on how many hits the standard battle sequence can still add
+// after the hit currently being generated (used to keep gBattleHits in range).
+static int MaxRemainingHits(struct BattleUnit * attacker)
+{
+    struct BattleHit * hit = gBattleHitIt;
+    int count = HitsPerRound(attacker);
+    int in_phase = 0, followup;
+    int a = HitsPerRound(&gBattleUnitA), b = HitsPerRound(&gBattleUnitB);
+
+    followup = a > b ? a : b;
+
+    // a brave weapon strikes twice in one phase
+    if (count == 2)
+    {
+        bool second = hit > gBattleHits
+            && ((hit - 1)->info & BATTLE_HIT_INFO_ACTORB) == (hit->info & BATTLE_HIT_INFO_ACTORB)
+            && ((hit - 1)->attributes & (BATTLE_HIT_ATTR_RETALIATE | BATTLE_HIT_ATTR_FOLLOWUP))
+                == (hit->attributes & (BATTLE_HIT_ATTR_RETALIATE | BATTLE_HIT_ATTR_FOLLOWUP));
+
+        in_phase = second ? 0 : 1;
+    }
+
+    if (hit->attributes & BATTLE_HIT_ATTR_FOLLOWUP)
+        return in_phase;
+
+    if (hit->attributes & BATTLE_HIT_ATTR_RETALIATE)
+        return in_phase + followup;
+
+    return in_phase + b + followup;
+}
+
 bool ParryBattleGenerateHit(struct BattleUnit * attacker, struct BattleUnit * defender)
 {
     struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+    bool riposte_now = FALSE;
+
+    // never write past the end of gBattleHits (last slot holds the end marker)
+    if (gBattleHitIt >= gBattleHits + (BATTLE_HIT_MAX_COUNT - 1))
+        return TRUE;
 
     if (attacker == &gBattleUnitB)
         gBattleHitIt->info |= BATTLE_HIT_INFO_ACTORB;
@@ -310,7 +356,17 @@ bool ParryBattleGenerateHit(struct BattleUnit * attacker, struct BattleUnit * de
                     gBattleSt.hit = 0; // forced miss
 
                 if (res == RES_PARRY)
+                {
                     proc->riposte = TRUE;
+
+                    // counter right away if the defender can strike back and
+                    // the hit list is guaranteed to have room for it
+                    if (defender->weapon != 0
+                        && (gBattleHitIt - gBattleHits) + 2 + MaxRemainingHits(attacker) <= BATTLE_HIT_MAX_COUNT - 1)
+                    {
+                        riposte_now = TRUE;
+                    }
+                }
             }
             else if (idx == proc->n_done && !proc->pending)
             {
@@ -321,7 +377,7 @@ bool ParryBattleGenerateHit(struct BattleUnit * attacker, struct BattleUnit * de
         }
         else if (UNIT_FACTION(&attacker->unit) == FACTION_BLUE && proc->riposte)
         {
-            // riposte: guaranteed hit with +50% of the damage margin
+            // riposte: +50% of the damage margin
             int margin = gBattleSt.attack - gBattleSt.defense;
 
             proc->riposte = FALSE;
@@ -350,6 +406,19 @@ bool ParryBattleGenerateHit(struct BattleUnit * attacker, struct BattleUnit * de
     }
 
     gBattleHitIt++;
+
+    if (riposte_now)
+    {
+        // the parrying unit hits back immediately
+        gBattleHitIt->attributes = (defender == &gBattleUnitB) ? BATTLE_HIT_ATTR_RETALIATE : BATTLE_HIT_ATTR_FOLLOWUP;
+
+        if (ParryBattleGenerateHit(defender, attacker))
+            return TRUE;
+
+        // the next hit continues the interrupted phase
+        gBattleHitIt->attributes = 0;
+    }
+
     return FALSE;
 }
 
@@ -729,6 +798,10 @@ static void ZoomOam(u16 * buf, int count)
         if (a0 & 0x0300)
             continue;
 
+        // effect sprites (palette 15, effect tiles) stay crisp
+        if ((buf[2] >> 12) == 15 && ((buf[2] & 0x3FF) >= 30 * 32 + 17) && ((buf[2] & 0x3FF) <= 31 * 32 + 26))
+            continue;
+
         shape = (a0 >> 14) & 3;
 
         if (shape == 3)
@@ -791,9 +864,33 @@ struct OamSectionMirror
 extern u16 * gOamHiPutIt;
 extern u16 * gOamLoPutIt;
 
+#define FX_PAL_ID 15
+static bool FxActive(void);
+static void FxPutOam(u16 * buf, int count);
+
 // hook: replaces SyncHiOam
 void ParrySyncHiOam(void)
 {
+    if (FxActive())
+    {
+        int i;
+
+        // the scene restores palettes from its own copy (e.g. after the miss
+        // flash): keep our effect palette in place while effects are shown
+        for (i = 0; i < 16; ++i)
+            ((u16 *) (PLTT + 0x200))[FX_PAL_ID * 16 + i] = gParryGfxPal[i];
+
+        // sprite-sheet uploads (ApplyDataMoves, just before this) can cover
+        // the effect tiles: put them back every frame
+        for (i = 0; i < 10 * 16; ++i)
+        {
+            ((u16 *) (0x06010000 + (30 * 32 + 17) * 32))[i] = ((u16 const *) gParryGfxRow30)[i];
+            ((u16 *) (0x06010000 + (31 * 32 + 17) * 32))[i] = ((u16 const *) gParryGfxRow31)[i];
+        }
+
+        FxPutOam(sOamHiSect->buf, sOamHiSect->count);
+    }
+
     if (ZoomActive())
     {
         ZoomPutMatrices();
@@ -1210,6 +1307,8 @@ static void StartParry(ProcPtr parent, struct Unit * instigator, struct Unit * t
 // ---------------------------------------------------------------------------
 // hook: replaces BeginBattleAnimations
 
+static void LiveReset(void);
+
 void ParryBeginBattleAnimations(void)
 {
     struct ParryProc * proc = FindProc(ProcScr_ParryQte);
@@ -1223,7 +1322,11 @@ void ParryBeginBattleAnimations(void)
     if (PrepareBattleGraphicsMaybe_())
     {
         if (proc != NULL && proc->mode == MODE_PENDING)
+        {
             proc->mode = MODE_SCENE;
+            proc->in_scene = TRUE;
+            LiveReset();
+        }
 
         SetBanimLinkArenaFlag(0);
         BeginAnimsOnBattleAnimations();
@@ -1256,15 +1359,597 @@ void ParryBeginBattleAnimations(void)
 // ---------------------------------------------------------------------------
 // battle scene: segment playback
 
+// ---------------------------------------------------------------------------
+// live defence inside the battle scene
+//
+// The pending enemy strike is the last hit of the current segment and is
+// prepared as a hit. While it plays, we count the frames left until the
+// attacker's animation reaches its contact command (read straight from the
+// animation script), zoom the scene so full zoom == the dodge window around
+// contact, and judge presses against what the player saw. A success turns
+// the blow into a miss before the contact command runs.
+
+#define LIVE_SEEN_LAG 2   // frames between a computed frame and a press made on seeing it
+#define LIVE_RAMP 20      // zoom-in length before the dodge window
+#define LIVE_DECAY 10
+
+enum { BOSS_NONE, BOSS_RUSH, BOSS_DELAY, BOSS_FEINT, BOSS_LONG, BOSS_KIND_COUNT };
+
+enum { FX_NONE, FX_PARRY, FX_COUNTER };
+
+struct LiveSt
+{
+    u8 armed;        // the segment ends with an undecided enemy strike
+    u8 decided;
+    u8 round;        // round index of that strike in the current segment
+    u8 side;         // attacker side (0 left, 1 right)
+    u8 boss;
+    u8 hold_trigger;
+    u8 hold_len;
+    u8 hold_left;
+    u8 hold_done;
+    u8 hold_active;
+    u8 stall;        // frames frozen at the contact point waiting for input
+    u8 hist_n;
+    i8 hist[4];      // recent "frames until contact" values
+    u8 zoom_on;
+    u8 decay;        // zoom-out countdown
+    u16 decay_from;
+    u8 counter_next; // show COUNTER! when the next segment starts
+    u8 gfx_loaded;
+    u8 spark_t;      // spark effect frame counter (0 = off)
+    u8 text_t;       // text effect frames left
+    u8 text_kind;
+    u8 dodge_t;      // dodge step frames left
+    i8 dodge_dx;     // current dodge offset applied to the defender sprites
+    i16 spark_x, spark_y;
+    i16 text_x, text_y;
+};
+
+#define sLive ((struct LiveSt *) 0x02027600)
+#define sGfxSave ((u8 *) 0x02027700)   // 640 bytes of OBJ tiles
+#define sPalSave ((u16 *) 0x02027980)  // 16 colours
+
+#define FX_PAL 15
+#define FX_TILE_ROW30 (30 * 32 + 17)
+#define FX_TILE_ROW31 (31 * 32 + 17)
+#define FX_AFFINE 27
+
+static void LiveReset(void)
+{
+    u8 * p = (u8 *) sLive;
+    unsigned i;
+
+    for (i = 0; i < sizeof(struct LiveSt); ++i)
+        p[i] = 0;
+}
+
+static void Copy16(void const * src, void * dst, int bytes)
+{
+    u16 const * s = src;
+    u16 * d = dst;
+    int i;
+
+    for (i = 0; i < bytes / 2; ++i)
+        d[i] = s[i];
+}
+
+static u16 * ObjTile(int tile)
+{
+    return (u16 *) (0x06010000 + tile * 32);
+}
+
+static void FxLoadGfx(void)
+{
+    int i;
+
+    if (sLive->gfx_loaded)
+        return;
+
+    // keep what was there so it can be put back afterwards
+    Copy16(ObjTile(FX_TILE_ROW30), sGfxSave, 10 * 32);
+    Copy16(ObjTile(FX_TILE_ROW31), sGfxSave + 10 * 32, 10 * 32);
+
+    for (i = 0; i < 16; ++i)
+        sPalSave[i] = ((u16 *) (PLTT + 0x200))[FX_PAL * 16 + i];
+
+    Copy16(gParryGfxRow30, ObjTile(FX_TILE_ROW30), 10 * 32);
+    Copy16(gParryGfxRow31, ObjTile(FX_TILE_ROW31), 10 * 32);
+
+    // write only our palette, straight to palette RAM (and its shadow, in
+    // case the scene syncs it); never resync the whole palette
+    for (i = 0; i < 16; ++i)
+    {
+        ((u16 *) (PLTT + 0x200))[FX_PAL * 16 + i] = gParryGfxPal[i];
+        gPal[0x100 + FX_PAL * 16 + i] = gParryGfxPal[i];
+    }
+
+    sLive->gfx_loaded = TRUE;
+}
+
+static void FxRestoreGfx(void)
+{
+    int i;
+
+    if (!sLive->gfx_loaded)
+        return;
+
+    Copy16(sGfxSave, ObjTile(FX_TILE_ROW30), 10 * 32);
+    Copy16(sGfxSave + 10 * 32, ObjTile(FX_TILE_ROW31), 10 * 32);
+
+    for (i = 0; i < 16; ++i)
+    {
+        ((u16 *) (PLTT + 0x200))[FX_PAL * 16 + i] = sPalSave[i];
+        gPal[0x100 + FX_PAL * 16 + i] = sPalSave[i];
+    }
+
+    sLive->gfx_loaded = FALSE;
+}
+
+static struct BaSprite * AtkAnim(int i) { return gAnims[sLive->side * 2 + i]; }
+static struct BaSprite * DefAnim(int i) { return gAnims[(sLive->side ^ 1) * 2 + i]; }
+
+static void SetAtkFrozen(bool frozen)
+{
+    int i;
+
+    for (i = 0; i < 2; ++i)
+    {
+        struct BaSprite * bas = AtkAnim(i);
+
+        if (bas == NULL)
+            continue;
+
+        if (frozen)
+            bas->flags |= 0x0008; // BAS_BIT_FROZEN
+        else
+            bas->flags &= ~0x0008;
+    }
+}
+
+// Frames (sprite updates) until the attacker's script reads its contact
+// command, or -1 if it cannot be known yet (waiting for its turn, jumps...).
+static int FramesUntilContact(struct BaSprite * bas, bool rush)
+{
+    u32 const * it = bas->scrCur;
+    int frames = bas->timer;
+    int fallback = -1;
+    int i;
+
+    if (rush && frames > 1)
+        frames = (frames + 1) / 2;
+
+    for (i = 0; i < 96; ++i)
+    {
+        u32 ins = *it++;
+        int d;
+
+        if (ins & 0x80000000)
+        {
+            if (ins & 0x40000000)
+                return fallback;
+
+            switch (0x3F & (ins >> 24))
+            {
+
+            case 5: // command
+            {
+                int cmd = ins & 0xFF;
+
+                // 0x1A: normal hit lands; 0x08-0x0C: critical lands; 0x05: spell
+                if (cmd == 0x1A || cmd == 0x05 || (cmd >= 0x08 && cmd <= 0x0C))
+                    return frames;
+
+                // 0x04 sets up a dodge; it is the contact point only if no
+                // hit command follows before the attack ends
+                if (cmd == 0x04 && fallback < 0)
+                    fallback = frames;
+
+                if (cmd == 0x01 || cmd == 0x02 || cmd == 0x03 || cmd == 0x13 || cmd == 0x18 || cmd == 0x39)
+                    return (i == 0) ? -1 : fallback;
+
+                frames += 1;
+                break;
+            }
+
+            case 6: // frame
+                d = ins & 0xFFFF;
+                frames += rush ? (d + 1) / 2 : d;
+                it += 2;
+                break;
+
+            case 4: // wait
+                d = ins & 0xFFFF;
+                frames += rush ? (d + 1) / 2 : d;
+                break;
+
+            case 3: // move
+                d = (ins >> 16) & 0xFF;
+                frames += rush ? (d + 1) / 2 : d;
+                break;
+
+            default:
+                return fallback;
+
+            }
+        }
+        else
+        {
+            d = ((ins >> 26) & 0x1C) + (ins & 3);
+            frames += rush ? (d + 1) / 2 : d;
+        }
+    }
+
+    return fallback;
+}
+
+static struct ParryWindow const * CurWindow(void)
+{
+    return &gParryConfig.windows[gParryConfig.difficulty < 3 ? gParryConfig.difficulty : 1];
+}
+
+static void FlipToMiss(void)
+{
+    u16 * rounds = (u16 *) 0x0203CD1E; // parsed per-round animation types
+    int idx = sLive->round * 2 + (sLive->side ^ 1);
+    int miss = (gEkrDistanceType == EKR_DISTANCE_CLOSE) ? 4 : 5;
+
+    rounds[idx] = (rounds[idx] & 0xF000) | miss;
+}
+
+static void StartEffect(int kind)
+{
+    struct BaSprite * def = DefAnim(0);
+    struct BaSprite * atk = AtkAnim(0);
+    int dx;
+
+    FxLoadGfx();
+
+    if (kind == FX_PARRY)
+    {
+        dx = atk->xPosition - def->xPosition;
+        sLive->spark_x = def->xPosition + dx / 3;
+        sLive->spark_y = def->yPosition - 26;
+        sLive->spark_t = 1;
+
+        sLive->text_kind = FX_PARRY;
+        sLive->text_t = 48;
+        sLive->text_x = 120 - 24;
+        sLive->text_y = 18;
+    }
+    else
+    {
+        sLive->text_kind = FX_COUNTER;
+        sLive->text_t = 48;
+        sLive->text_x = 120 - 32;
+        sLive->text_y = 18;
+    }
+}
+
+static void LiveDecide(struct ParryProc * proc, int res)
+{
+    struct ParryWindow const * win = CurWindow();
+
+    sLive->decided = TRUE;
+    sLive->armed = FALSE;
+
+    if (res == RES_PARRY || res == RES_DODGE)
+        FlipToMiss();
+
+    proc->results[proc->n_done++] = res;
+
+    if (res == RES_PARRY)
+    {
+        PlaySe(0x6A);
+        StartEffect(FX_PARRY);
+        sLive->counter_next = TRUE;
+    }
+    else if (res == RES_DODGE)
+    {
+        PlaySe(0x67);
+        sLive->dodge_t = 18;
+    }
+
+    // let the swing continue
+    sLive->hold_active = FALSE;
+    sLive->stall = 0;
+    SetAtkFrozen(FALSE);
+
+    // ease the zoom out from where it is
+    sLive->decay = LIVE_DECAY;
+    sLive->decay_from = sZoom->scale;
+
+    (void) win;
+}
+
+static int LiveZoomLevel(int e)
+{
+    struct ParryWindow const * win = CurWindow();
+    int level = 0;
+
+    if (e <= win->dodge_early && e >= -win->dodge_late)
+        level = 256;
+    else if (e > win->dodge_early && e <= win->dodge_early + LIVE_RAMP)
+        level = Smooth(((win->dodge_early + LIVE_RAMP - e) * 256) / LIVE_RAMP);
+    else if (e < -win->dodge_late)
+    {
+        // window over: start easing out immediately
+        level = 256 - (-win->dodge_late - e) * 64;
+
+        if (level < 0)
+            level = 0;
+    }
+
+    // feint: the zoom swells early, then backs off, while the boss holds
+    if (sLive->boss == BOSS_FEINT && sLive->hold_active)
+    {
+        int t = sLive->hold_len - sLive->hold_left;
+        int f = 0;
+
+        if (t < 12)
+            f = (Smooth((t * 256) / 12) * 170) >> 8;
+        else if (t < 22)
+            f = (170 * (256 - Smooth(((t - 12) * 256) / 10))) >> 8;
+
+        if (f > level)
+            level = f;
+    }
+
+    return level;
+}
+
+static void LiveStep(struct ParryProc * proc)
+{
+    struct ParryWindow const * win = CurWindow();
+    struct BaSprite * atk;
+    int f, e, seen;
+
+    if (!sLive->armed || sLive->decided)
+        return;
+
+    atk = AtkAnim(0);
+
+    if (atk == NULL || atk->nextRoundId == 0 || atk->nextRoundId - 1 != sLive->round)
+        return;
+
+    // boss hold in progress
+    if (sLive->hold_active)
+    {
+        if (--sLive->hold_left == 0)
+        {
+            sLive->hold_active = FALSE;
+            sLive->hold_done = TRUE;
+            SetAtkFrozen(FALSE);
+        }
+    }
+
+    if (sLive->stall)
+    {
+        e = -(int) sLive->stall;
+        sLive->stall++;
+    }
+    else
+    {
+        f = FramesUntilContact(atk, sLive->boss == BOSS_RUSH);
+
+        if (f < 0)
+            return; // not swinging yet
+
+        // rush: the swing plays at double speed (apply first, then measure)
+        if (sLive->boss == BOSS_RUSH && f > 1)
+        {
+            int i;
+
+            for (i = 0; i < 2; ++i)
+            {
+                struct BaSprite * bas = AtkAnim(i);
+
+                if (bas != NULL && bas->timer > 1)
+                    bas->timer--;
+            }
+
+            f = FramesUntilContact(atk, TRUE);
+        }
+
+        // delayed / feint: freeze mid-swing for a while
+        if (sLive->boss >= BOSS_DELAY && !sLive->hold_done && !sLive->hold_active && f - 1 <= sLive->hold_trigger)
+        {
+            sLive->hold_active = TRUE;
+            sLive->hold_left = sLive->hold_len;
+            SetAtkFrozen(TRUE);
+        }
+
+        e = f - 1 + (sLive->hold_active ? sLive->hold_left : (!sLive->hold_done && sLive->boss >= BOSS_DELAY ? sLive->hold_len : 0));
+
+        if (f <= 1)
+        {
+            // the next sprite update would play the contact: hold it there
+            // until the player has had the whole late part of the window
+            sLive->stall = 1;
+            SetAtkFrozen(TRUE);
+            e = 0;
+        }
+    }
+
+    if (!sLive->zoom_on)
+    {
+        ZoomBegin(proc);
+        sLive->zoom_on = TRUE;
+    }
+
+    // history of e, to judge presses against what was on screen
+    sLive->hist[3] = sLive->hist[2];
+    sLive->hist[2] = sLive->hist[1];
+    sLive->hist[1] = sLive->hist[0];
+    sLive->hist[0] = e;
+
+    if (sLive->hist_n < 4)
+        sLive->hist_n++;
+
+    seen = sLive->hist_n > LIVE_SEEN_LAG ? sLive->hist[LIVE_SEEN_LAG] : e + LIVE_SEEN_LAG;
+
+    ZoomSetScale(0x100 + ((LiveZoomLevel(e) * ZOOM_MAX_EXTRA) >> 8));
+
+    if (gKeySt->pressed & (KEY_BUTTON_A | KEY_BUTTON_B))
+    {
+        bool parry = (gKeySt->pressed & KEY_BUTTON_A) != 0;
+        int early = parry ? win->parry_early : win->dodge_early;
+        int late = parry ? win->parry_late : win->dodge_late;
+
+        if (seen <= early && seen >= -late)
+            LiveDecide(proc, parry ? RES_PARRY : RES_DODGE);
+        else
+            LiveDecide(proc, RES_FAIL);
+
+        return;
+    }
+
+    if (seen < -(int) (win->dodge_late > win->parry_late ? win->dodge_late : win->parry_late))
+        LiveDecide(proc, RES_FAIL);
+}
+
+// effects and zoom-out, every frame of the scene
+static void LiveEffects(void)
+{
+    if (sLive->decay != 0)
+    {
+        int level = ((sLive->decay_from - 0x100) * Smooth((sLive->decay * 256) / LIVE_DECAY)) >> 8;
+
+        sLive->decay--;
+        ZoomSetScale(0x100 + level);
+
+        if (sLive->decay == 0)
+        {
+            ZoomEnd();
+            sLive->zoom_on = FALSE;
+        }
+    }
+
+    if (sLive->spark_t != 0)
+    {
+        if (++sLive->spark_t > 22)
+            sLive->spark_t = 0;
+    }
+
+    if (sLive->text_t != 0)
+        sLive->text_t--;
+
+    if (sLive->dodge_t != 0)
+    {
+        // quick step away from the blow, then back
+        int t = 18 - sLive->dodge_t;
+        int target, dir, i;
+
+        dir = (sLive->side == 0) ? 1 : -1; // defender moves away from the attacker
+        target = (t < 4) ? (t + 1) * 3 : (t < 10 ? 12 : 12 - (t - 9) * 3 / 2);
+
+        if (target < 0)
+            target = 0;
+
+        target *= dir;
+
+        for (i = 0; i < 2; ++i)
+        {
+            struct BaSprite * bas = DefAnim(i);
+
+            if (bas != NULL)
+                bas->xPosition += target - sLive->dodge_dx;
+        }
+
+        sLive->dodge_dx = target;
+
+        if (--sLive->dodge_t == 0)
+        {
+            for (i = 0; i < 2; ++i)
+            {
+                struct BaSprite * bas = DefAnim(i);
+
+                if (bas != NULL)
+                    bas->xPosition -= sLive->dodge_dx;
+            }
+
+            sLive->dodge_dx = 0;
+        }
+    }
+
+    if (sLive->gfx_loaded && sLive->spark_t == 0 && sLive->text_t == 0)
+        FxRestoreGfx();
+}
+
+// Called from the VBlank OAM sync: put effect sprites in front of everything.
+static void FxPutOam(u16 * buf, int count)
+{
+    u16 ents[4][3];
+    int n = 0, i;
+
+    if (sLive->spark_t != 0)
+    {
+        // 16x16 spark, affine double-size, growing then shrinking
+        int t = sLive->spark_t;
+        int scale = (t < 6) ? 192 + t * 54 : 516 - (t - 6) * 28;
+        int inv;
+
+        if (scale < 64)
+            scale = 64;
+
+        inv = 0x10000 / scale;
+
+        SetObjAffine(FX_AFFINE, inv, 0, 0, inv);
+
+        ents[n][0] = 0x0300 | ((sLive->spark_y - 16) & 0xFF);
+        ents[n][1] = (1 << 14) | (FX_AFFINE << 9) | ((sLive->spark_x - 16) & 0x1FF);
+        ents[n][2] = (FX_PAL << 12) | FX_TILE_ROW30;
+        n++;
+    }
+
+    if (sLive->text_t != 0)
+    {
+        int tile = (sLive->text_kind == FX_PARRY) ? FX_TILE_ROW30 + 2 : FX_TILE_ROW31 + 2;
+        int bob = sLive->text_t > 40 ? (sLive->text_t - 40) : 0;
+
+        for (i = 0; i < 2; ++i)
+        {
+            ents[n][0] = (1 << 14) | ((sLive->text_y + bob) & 0xFF);       // wide
+            ents[n][1] = (1 << 14) | ((sLive->text_x + i * 32) & 0x1FF);  // 32x8
+            ents[n][2] = (FX_PAL << 12) | (tile + i * 4);
+            n++;
+        }
+    }
+
+    if (n == 0 || count <= n)
+        return;
+
+    // make room at the front (front entries are drawn on top)
+    for (i = count - 1; i >= n; --i)
+    {
+        buf[i * 4 + 0] = buf[(i - n) * 4 + 0];
+        buf[i * 4 + 1] = buf[(i - n) * 4 + 1];
+        buf[i * 4 + 2] = buf[(i - n) * 4 + 2];
+    }
+
+    for (i = 0; i < n; ++i)
+    {
+        buf[i * 4 + 0] = ents[i][0];
+        buf[i * 4 + 1] = ents[i][1];
+        buf[i * 4 + 2] = ents[i][2];
+    }
+}
+
+static bool FxActive(void)
+{
+    return sLive->gfx_loaded && (sLive->spark_t != 0 || sLive->text_t != 0);
+}
+
 // Keep only hits [shown, end) of the latest generation in gBattleHits and
 // rebuild the battle animation script from them (same as the arena does).
 static void PrepareSegment(struct ParryProc * proc)
 {
-    int end = proc->pending ? proc->pending_hit : proc->total;
-    int i, n = end - proc->shown;
+    int start = proc->shown;
+    int end = proc->pending ? proc->pending_hit + 1 : proc->total;
+    int i, n = end - start;
 
     for (i = 0; i < n; ++i)
-        gBattleHits[i] = gBattleHits[proc->shown + i];
+        gBattleHits[i] = gBattleHits[start + i];
 
     gBattleHits[n].attributes = 0;
     gBattleHits[n].info = BATTLE_HIT_INFO_END;
@@ -1273,13 +1958,52 @@ static void PrepareSegment(struct ParryProc * proc)
     proc->shown = end;
     proc->seg_ready = TRUE;
 
+    // live defence for the strike that closes this segment
+    sLive->armed = proc->pending;
+    sLive->decided = FALSE;
+    sLive->round = n - 1;
+    sLive->stall = 0;
+    sLive->hist_n = 0;
+    sLive->hold_active = FALSE;
+    sLive->hold_done = FALSE;
+    sLive->boss = BOSS_NONE;
+
+    if (proc->pending)
+    {
+        struct BattleHit * hit = gBattleHits + (n - 1);
+        bool actor_b = (hit->info & BATTLE_HIT_INFO_ACTORB) != 0;
+        struct BattleUnit * enemy = actor_b ? &gBattleUnitB : &gBattleUnitA;
+
+        sLive->side = (gpEkrBattleUnitLeft == enemy) ? 0 : 1;
+
+        if (proc->pending_boss)
+        {
+            static CONST_DATA u8 kinds[] = { BOSS_RUSH, BOSS_DELAY, BOSS_FEINT, BOSS_LONG, BOSS_NONE };
+
+            sLive->boss = kinds[RandNextB() % 5];
+
+            switch (sLive->boss)
+            {
+            case BOSS_DELAY: sLive->hold_trigger = 8;  sLive->hold_len = 16; break;
+            case BOSS_FEINT: sLive->hold_trigger = 10; sLive->hold_len = 28; break;
+            case BOSS_LONG:  sLive->hold_trigger = 5;  sLive->hold_len = 26; break;
+            }
+        }
+    }
+
     ParseBattleHitToBanimCmd();
     BasInit();
     UpdateBanimFrame();
     InitMainAnims();
-}
 
-static void ParryEkrQte(struct ProcEkrBattle * ekr);
+    if (sLive->counter_next && start > 0)
+    {
+        sLive->counter_next = FALSE;
+        StartEffect(FX_COUNTER);
+    }
+
+    sLive->counter_next = FALSE;
+}
 
 static void TriggerRoundStartBody(struct ProcEkrBattle * proc)
 {
@@ -1320,40 +2044,23 @@ void ParryEkrTriggerNewRoundStart(struct ProcEkrBattle * ekr)
 {
     struct ParryProc * proc = FindProc(ProcScr_ParryQte);
 
-    if (proc != NULL && proc->mode == MODE_SCENE && !proc->seg_ready)
+    if (proc != NULL && proc->mode == MODE_SCENE)
     {
-        if (proc->pending && proc->pending_hit == proc->shown)
+        if (!proc->seg_ready)
         {
-            // the next thing to happen is an undecided enemy strike:
-            // play the timing challenge right here in the battle
-            BeginQte(proc, TRUE);
-            ekr->proc_repeat_func = (ProcFunc) ParryEkrQte;
-            return;
+            bool continuation = proc->shown > 0;
+
+            PrepareSegment(proc);
+
+            // later segments follow straight on, without the opening pause
+            if (continuation && ekr->timer < 0x1E)
+                ekr->timer = 0x1E;
         }
 
-        PrepareSegment(proc);
+        LiveEffects();
     }
 
     TriggerRoundStartBody(ekr);
-}
-
-static void ParryEkrQte(struct ProcEkrBattle * ekr)
-{
-    struct ParryProc * proc = FindProc(ProcScr_ParryQte);
-
-    if (proc == NULL)
-    {
-        ekr->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
-        return;
-    }
-
-    if (!QteStep(proc))
-        return;
-
-    proc->in_scene = FALSE;
-    Regenerate(proc);
-
-    ekr->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
 }
 
 // hook: replaces EkrBattleInRound
@@ -1361,6 +2068,12 @@ void ParryEkrBattleInRound(struct ProcEkrBattle * proc)
 {
     struct ParryProc * pp = FindProc(ProcScr_ParryQte);
     int ret = 0;
+
+    if (pp != NULL && pp->mode == MODE_SCENE)
+    {
+        LiveStep(pp);
+        LiveEffects();
+    }
 
     if (gKeySt->held & KEY_BUTTON_B)
         proc->speedup = TRUE;
@@ -1423,14 +2136,44 @@ void ParryEkrBattleInRound(struct ProcEkrBattle * proc)
         break;
     }
 
-    if (ret == 1 && pp != NULL && pp->mode == MODE_SCENE && pp->shown < pp->total
-        && gEkrDistanceType != EKR_DISTANCE_PROMOTION)
+    if (ret == 1 && pp != NULL && pp->mode == MODE_SCENE)
     {
-        // more of this battle remains: next segment
-        pp->seg_ready = FALSE;
-        proc->timer = 0;
-        proc->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
-        return;
+        // safety: never leave a strike undecided or the scene zoomed/frozen
+        if (sLive->armed && !sLive->decided)
+            LiveDecide(pp, RES_FAIL);
+
+        if (sLive->zoom_on && sLive->decay == 0)
+        {
+            ZoomEnd();
+            sLive->zoom_on = FALSE;
+        }
+
+        // the decided strike changes what follows: regenerate the battle
+        if (sLive->decided)
+        {
+            sLive->decided = FALSE;
+            Regenerate(pp);
+        }
+
+        if (pp->shown < pp->total && gEkrDistanceType != EKR_DISTANCE_PROMOTION)
+        {
+            // more of this battle remains: next segment
+            pp->seg_ready = FALSE;
+            proc->timer = 0;
+            proc->proc_repeat_func = (ProcFunc) ParryEkrTriggerNewRoundStart;
+            return;
+        }
+
+        if (sLive->decay != 0)
+        {
+            sLive->decay = 0;
+            ZoomEnd();
+            sLive->zoom_on = FALSE;
+        }
+
+        sLive->text_t = 0;
+        sLive->spark_t = 0;
+        FxRestoreGfx();
     }
 
     if (ret == 1)
