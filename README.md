@@ -5,43 +5,50 @@ A real-time dodge/parry battle system for FE6 (Japanese ROM `AFEJ` with the Engl
 ## How battles work
 
 - **Hit chance is gone.** Every blow lands (the HUD shows HIT 100), unless you parry or dodge it.
-- **Enemy attacks play live.** While the enemy swings, the battle scene gently zooms in. The zoom is
-  driven by the attack animation itself: it reaches full zoom when the dodge window opens and is centred
-  on the frame the weapon actually lands. If you haven't pressed yet, the swing pauses for a moment
-  at the point of impact (a short hit-stop) so the late part of the window stays fair.
-  - **B while fully zoomed — Dodge:** the blow misses and your unit steps back out of the way.
-  - **A right as the weapon lands — Parry:** the blow misses with a spark and **PARRY!**, and your unit
-    immediately hits back (**COUNTER!**) for +50% of its damage margin.
+- **Defend live, during the enemy's swing.** The windows sit on the frame the enemy's weapon actually
+  lands, read from the attack animation itself. If you haven't pressed yet, the swing pauses for a moment
+  at the point of impact (hit-stop) so the late part of the window stays fair.
+  - **A as the weapon lands — Parry (9 frames, 0.15 s):** the blow misses with a spark and **PARRY!**,
+    and your unit hits straight back (**COUNTER!**) for +50% of its damage margin.
+  - **B around the impact — Dodge (wider window):** the blow misses and your unit steps back.
   - **Too early, too late or no input:** the blow lands.
-- **Unique bosses** vary their swings: Rush (double-speed swing), Delayed and Long Delay (the swing
-  freezes mid-way before striking) and Feint (the zoom swells early, then backs off, before the real blow).
+- **Swings depend on the weapon, not the enemy.** Every weapon type has its own style, and it changes
+  with the weapon's rank (E to S): 42 styles in all.
 - With battle animations off, the challenge plays on the map with a text box instead.
+
+## Swing styles
+
+| Weapon | Style | How rank changes it |
+|---|---|---|
+| Sword | Quick and precise | D+ swings at double speed; C+ adds short hitches; A/S feint twice |
+| Lance | Steady, pauses before the thrust | Longer pauses with rank; B/S pause twice; S is fast |
+| Axe | Heavy wind-up high in the swing | Longer wind-ups; B/S add a second hesitation |
+| Bow | Holds the draw before release | Longer draws; B/S release faster; S double-draws |
+| Anima | Fast casts | Higher ranks gather power before releasing |
+| Light | Slow, long charge | Longer charges; B/S charge twice |
+| Dark | Erratic, stuttering casts | A stutters three times; D/B/S cast at double speed |
+
+Timings are in `sSwingProfiles` in `src/hack_parry.c`. Whatever the style, the final approach to
+impact always runs frame by frame, so every frame of the windows exists.
 
 ## Timing windows (60 fps)
 
-| Difficulty | Parry | Dodge = full-zoom hold |
+| Difficulty | Parry | Dodge |
 |---|---|---|
-| Story | 11 frames | 20 frames |
-| Expeditioner | 8 frames | 14 frames |
-| Expert | 5 frames (~83 ms) | 9 frames (150 ms) |
+| Story | 9 frames (0.15 s) | 21 frames |
+| Expeditioner | 9 frames (0.15 s) | 17 frames |
+| Expert | 9 frames (0.15 s) | 15 frames |
 
-Modeled on Clair Obscur: Expedition 33, whose exact windows aren't published, so these are estimates.
-
-## About the zoom
-
-The GBA can only scale sprites, not the tile layers the battle background and platform are drawn on.
-Fighters are scaled in both directions with affine sprites; the background and platform are stretched
-vertically to match, line by line from the HBlank interrupt. The HUD stays fixed. Maximum zoom is +6.25%.
-Presses are judged against what was on screen when you pressed (two frames earlier than the game is
-computing), so full zoom on screen is exactly the dodge window. The counterattack after a parry is only
-added when the battle record (7 blows) is guaranteed to have room for it.
+Presses are judged against what was on screen when you pressed. If the game itself drops a frame at
+impact (as the original game does on some hits), that frame can stretch a window by 1/60 s. The
+counterattack after a parry is only added when the battle record (7 blows) has room for it.
 
 ## Applying
 
 Apply `patches/Reflex Defense (Expert).ips` to your own copy of the translated ROM. No ROM files are included.
 
 Config at ROM offset `0xF00000` (`RFX1` magic): byte +4 = difficulty (0 Story, 1 Expeditioner, 2 Expert),
-+5 = enabled, +6 = every enemy uses boss techniques.
++5 = enabled.
 
 ## Building
 

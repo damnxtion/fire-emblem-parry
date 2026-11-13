@@ -63,9 +63,9 @@ struct ParryConfig const gParryConfig __attribute__((section(".hackcfg"))) =
     { 'R', 'F', 'X', '1' },
     1, 1, 0, 0,
     {
-        { 7, 3, 13, 6 }, // Story        parry 11f / dodge 20f
-        { 5, 2,  9, 4 }, // Expeditioner parry  8f / dodge 14f
-        { 3, 1,  6, 2 }, // Expert       parry  5f / dodge  9f
+        { 4, 4, 10, 10 }, // Story        parry 9f (0.15 s) / dodge 21f
+        { 4, 4,  8,  8 }, // Expeditioner parry 9f (0.15 s) / dodge 17f
+        { 4, 4,  7,  7 }, // Expert       parry 9f (0.15 s) / dodge 15f
         // window = early + impact frame + late
     },
 };
@@ -1373,7 +1373,6 @@ void ParryBeginBattleAnimations(void)
 #define LIVE_RAMP 20      // zoom-in length before the dodge window
 #define LIVE_DECAY 10
 
-enum { BOSS_NONE, BOSS_RUSH, BOSS_DELAY, BOSS_FEINT, BOSS_LONG, BOSS_KIND_COUNT };
 
 enum { FX_NONE, FX_PARRY, FX_COUNTER };
 
@@ -1383,11 +1382,12 @@ struct LiveSt
     u8 decided;
     u8 round;        // round index of that strike in the current segment
     u8 side;         // attacker side (0 left, 1 right)
-    u8 boss;
-    u8 hold_trigger;
-    u8 hold_len;
+    u8 fast;         // swing plays at double speed
+    u8 hold_n;       // number of mid-swing holds
+    u8 hold_t[3];    // hold starts when this many frames are left before contact
+    u8 hold_l[3];    // hold length in frames
+    u8 hold_idx;     // next hold to play
     u8 hold_left;
-    u8 hold_done;
     u8 hold_active;
     u8 stall;        // frames frozen at the contact point waiting for input
     u8 hist_n;
@@ -1588,6 +1588,94 @@ static struct ParryWindow const * CurWindow(void)
     return &gParryConfig.windows[gParryConfig.difficulty < 3 ? gParryConfig.difficulty : 1];
 }
 
+
+// ---------------------------------------------------------------------------
+// enemy swing styles: one per weapon type and weapon rank (E..S)
+//
+// fast: the swing plays at double speed.
+// holds: the swing freezes for `len` frames once only `trig` frames remain
+// before contact (wind-ups, drawn bows, charged spells, hesitations...).
+// The parry/dodge windows always sit on the real contact frame.
+
+struct SwingProfile
+{
+    u8 fast;
+    u8 t1, l1, t2, l2, t3, l3;
+};
+
+static CONST_DATA struct SwingProfile sSwingProfiles[8][6] =
+{
+    // sword: quick, precise; higher ranks feint with short hitches
+    { { 0, 0,0, 0,0, 0,0 }, { 1, 0,0, 0,0, 0,0 }, { 1, 10,4, 0,0, 0,0 },
+      { 1, 14,8, 0,0, 0,0 }, { 1, 16,6, 8,6, 0,0 }, { 1, 18,10, 8,8, 0,0 } },
+    // lance: steady, with a pause before the thrust
+    { { 0, 8,6, 0,0, 0,0 }, { 0, 8,10, 0,0, 0,0 }, { 0, 7,14, 0,0, 0,0 },
+      { 0, 14,8, 7,6, 0,0 }, { 0, 8,18, 0,0, 0,0 }, { 1, 14,12, 7,10, 0,0 } },
+    // axe: heavy, long wind-up high in the swing
+    { { 0, 20,10, 0,0, 0,0 }, { 0, 20,14, 0,0, 0,0 }, { 0, 18,18, 0,0, 0,0 },
+      { 0, 22,12, 8,8, 0,0 }, { 0, 16,24, 0,0, 0,0 }, { 0, 22,16, 7,12, 0,0 } },
+    // bow: the draw is held before release
+    { { 0, 6,8, 0,0, 0,0 }, { 0, 6,12, 0,0, 0,0 }, { 0, 6,16, 0,0, 0,0 },
+      { 1, 6,10, 0,0, 0,0 }, { 0, 6,20, 0,0, 0,0 }, { 1, 12,14, 6,12, 0,0 } },
+    // staff (cannot attack)
+    { { 0, 0,0, 0,0, 0,0 }, { 0, 0,0, 0,0, 0,0 }, { 0, 0,0, 0,0, 0,0 },
+      { 0, 0,0, 0,0, 0,0 }, { 0, 0,0, 0,0, 0,0 }, { 0, 0,0, 0,0, 0,0 } },
+    // anima: fast casts, higher ranks gather power
+    { { 0, 0,0, 0,0, 0,0 }, { 0, 8,8, 0,0, 0,0 }, { 1, 0,0, 0,0, 0,0 },
+      { 1, 8,10, 0,0, 0,0 }, { 0, 14,14, 6,6, 0,0 }, { 1, 10,16, 0,0, 0,0 } },
+    // light: slow, long charge
+    { { 0, 12,12, 0,0, 0,0 }, { 0, 12,16, 0,0, 0,0 }, { 0, 12,20, 0,0, 0,0 },
+      { 0, 16,12, 7,8, 0,0 }, { 0, 10,24, 0,0, 0,0 }, { 0, 18,18, 7,10, 0,0 } },
+    // dark: erratic, stuttering casts
+    { { 0, 14,6, 7,6, 0,0 }, { 1, 10,8, 0,0, 0,0 }, { 0, 18,10, 7,10, 0,0 },
+      { 1, 8,14, 0,0, 0,0 }, { 0, 20,8, 13,8, 7,8 }, { 1, 16,12, 7,12, 0,0 } },
+};
+
+static void LoadSwingProfile(int weapon)
+{
+    struct SwingProfile const * sp;
+    int kind, rank, i;
+    u8 t[3], l[3];
+
+    sLive->fast = FALSE;
+    sLive->hold_n = 0;
+    sLive->hold_idx = 0;
+
+    if (weapon == 0)
+        return;
+
+    kind = GetItemKind(weapon);
+
+    if (kind < 0 || kind > ITEM_KIND_ELDER)
+        return;
+
+    rank = GetWeaponLevelFromExp(GetItemRequiredExp(weapon));
+
+    if (rank < WPN_LEVEL_E)
+        rank = WPN_LEVEL_E; // personal / unranked weapons swing like E rank
+
+    if (rank > WPN_LEVEL_S)
+        rank = WPN_LEVEL_S;
+
+    sp = &sSwingProfiles[kind][rank - WPN_LEVEL_E];
+
+    sLive->fast = sp->fast;
+
+    t[0] = sp->t1; l[0] = sp->l1;
+    t[1] = sp->t2; l[1] = sp->l2;
+    t[2] = sp->t3; l[2] = sp->l3;
+
+    for (i = 0; i < 3; ++i)
+    {
+        if (l[i] == 0)
+            continue;
+
+        sLive->hold_t[sLive->hold_n] = t[i];
+        sLive->hold_l[sLive->hold_n] = l[i];
+        sLive->hold_n++;
+    }
+}
+
 static void FlipToMiss(void)
 {
     u16 * rounds = (u16 *) 0x0203CD1E; // parsed per-round animation types
@@ -1655,54 +1743,15 @@ static void LiveDecide(struct ParryProc * proc, int res)
     sLive->stall = 0;
     SetAtkFrozen(FALSE);
 
-    // ease the zoom out from where it is
-    sLive->decay = LIVE_DECAY;
-    sLive->decay_from = sZoom->scale;
 
     (void) win;
-}
-
-static int LiveZoomLevel(int e)
-{
-    struct ParryWindow const * win = CurWindow();
-    int level = 0;
-
-    if (e <= win->dodge_early && e >= -win->dodge_late)
-        level = 256;
-    else if (e > win->dodge_early && e <= win->dodge_early + LIVE_RAMP)
-        level = Smooth(((win->dodge_early + LIVE_RAMP - e) * 256) / LIVE_RAMP);
-    else if (e < -win->dodge_late)
-    {
-        // window over: start easing out immediately
-        level = 256 - (-win->dodge_late - e) * 64;
-
-        if (level < 0)
-            level = 0;
-    }
-
-    // feint: the zoom swells early, then backs off, while the boss holds
-    if (sLive->boss == BOSS_FEINT && sLive->hold_active)
-    {
-        int t = sLive->hold_len - sLive->hold_left;
-        int f = 0;
-
-        if (t < 12)
-            f = (Smooth((t * 256) / 12) * 170) >> 8;
-        else if (t < 22)
-            f = (170 * (256 - Smooth(((t - 12) * 256) / 10))) >> 8;
-
-        if (f > level)
-            level = f;
-    }
-
-    return level;
 }
 
 static void LiveStep(struct ParryProc * proc)
 {
     struct ParryWindow const * win = CurWindow();
     struct BaSprite * atk;
-    int f, e, seen;
+    int f, e, seen, i;
 
     if (!sLive->armed || sLive->decided)
         return;
@@ -1712,13 +1761,13 @@ static void LiveStep(struct ParryProc * proc)
     if (atk == NULL || atk->nextRoundId == 0 || atk->nextRoundId - 1 != sLive->round)
         return;
 
-    // boss hold in progress
+    // mid-swing hold in progress
     if (sLive->hold_active)
     {
         if (--sLive->hold_left == 0)
         {
             sLive->hold_active = FALSE;
-            sLive->hold_done = TRUE;
+            sLive->hold_idx++;
             SetAtkFrozen(FALSE);
         }
     }
@@ -1730,16 +1779,17 @@ static void LiveStep(struct ParryProc * proc)
     }
     else
     {
-        f = FramesUntilContact(atk, sLive->boss == BOSS_RUSH);
+        f = FramesUntilContact(atk, FALSE);
 
         if (f < 0)
             return; // not swinging yet
 
-        // rush: the swing plays at double speed (apply first, then measure)
-        if (sLive->boss == BOSS_RUSH && f > 1)
+        // fast weapons: double-speed swing, but only until shortly before the
+        // windows open, so the final approach runs frame by frame and every
+        // frame of the parry/dodge windows exists
+        if (sLive->fast && !sLive->hold_active
+            && f - 1 > win->dodge_early + LIVE_SEEN_LAG + 3)
         {
-            int i;
-
             for (i = 0; i < 2; ++i)
             {
                 struct BaSprite * bas = AtkAnim(i);
@@ -1748,20 +1798,28 @@ static void LiveStep(struct ParryProc * proc)
                     bas->timer--;
             }
 
-            f = FramesUntilContact(atk, TRUE);
+            f = FramesUntilContact(atk, FALSE);
         }
 
-        // delayed / feint: freeze mid-swing for a while
-        if (sLive->boss >= BOSS_DELAY && !sLive->hold_done && !sLive->hold_active && f - 1 <= sLive->hold_trigger)
+        // weapon holds: freeze mid-swing
+        if (!sLive->hold_active && sLive->hold_idx < sLive->hold_n
+            && f - 1 <= sLive->hold_t[sLive->hold_idx])
         {
             sLive->hold_active = TRUE;
-            sLive->hold_left = sLive->hold_len;
+            sLive->hold_left = sLive->hold_l[sLive->hold_idx];
             SetAtkFrozen(TRUE);
         }
 
-        e = f - 1 + (sLive->hold_active ? sLive->hold_left : (!sLive->hold_done && sLive->boss >= BOSS_DELAY ? sLive->hold_len : 0));
+        // frames until contact, including holds still to come
+        e = f - 1;
 
-        if (f <= 1)
+        if (sLive->hold_active)
+            e += sLive->hold_left;
+
+        for (i = sLive->hold_idx + (sLive->hold_active ? 1 : 0); i < sLive->hold_n; ++i)
+            e += sLive->hold_l[i];
+
+        if (f <= 1 && !sLive->hold_active)
         {
             // the next sprite update would play the contact: hold it there
             // until the player has had the whole late part of the window
@@ -1769,12 +1827,6 @@ static void LiveStep(struct ParryProc * proc)
             SetAtkFrozen(TRUE);
             e = 0;
         }
-    }
-
-    if (!sLive->zoom_on)
-    {
-        ZoomBegin(proc);
-        sLive->zoom_on = TRUE;
     }
 
     // history of e, to judge presses against what was on screen
@@ -1787,8 +1839,6 @@ static void LiveStep(struct ParryProc * proc)
         sLive->hist_n++;
 
     seen = sLive->hist_n > LIVE_SEEN_LAG ? sLive->hist[LIVE_SEEN_LAG] : e + LIVE_SEEN_LAG;
-
-    ZoomSetScale(0x100 + ((LiveZoomLevel(e) * ZOOM_MAX_EXTRA) >> 8));
 
     if (gKeySt->pressed & (KEY_BUTTON_A | KEY_BUTTON_B))
     {
@@ -1965,8 +2015,6 @@ static void PrepareSegment(struct ParryProc * proc)
     sLive->stall = 0;
     sLive->hist_n = 0;
     sLive->hold_active = FALSE;
-    sLive->hold_done = FALSE;
-    sLive->boss = BOSS_NONE;
 
     if (proc->pending)
     {
@@ -1976,19 +2024,8 @@ static void PrepareSegment(struct ParryProc * proc)
 
         sLive->side = (gpEkrBattleUnitLeft == enemy) ? 0 : 1;
 
-        if (proc->pending_boss)
-        {
-            static CONST_DATA u8 kinds[] = { BOSS_RUSH, BOSS_DELAY, BOSS_FEINT, BOSS_LONG, BOSS_NONE };
-
-            sLive->boss = kinds[RandNextB() % 5];
-
-            switch (sLive->boss)
-            {
-            case BOSS_DELAY: sLive->hold_trigger = 8;  sLive->hold_len = 16; break;
-            case BOSS_FEINT: sLive->hold_trigger = 10; sLive->hold_len = 28; break;
-            case BOSS_LONG:  sLive->hold_trigger = 5;  sLive->hold_len = 26; break;
-            }
-        }
+        // the swing style comes from the enemy's weapon, not the enemy
+        LoadSwingProfile(enemy->weapon);
     }
 
     ParseBattleHitToBanimCmd();
