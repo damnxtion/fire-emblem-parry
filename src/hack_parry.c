@@ -27,6 +27,10 @@
 #include "banim_sprite.h"
 #include "banim_ekrbattle.h"
 #include "arena.h"
+#include "armfunc.h"
+#include "oam.h"
+#include "bm.h"
+#include "gba/gba.h"
 
 #include "hack_parry_str.h"
 
@@ -58,9 +62,10 @@ struct ParryConfig const gParryConfig __attribute__((section(".hackcfg"))) =
     { 'R', 'F', 'X', '1' },
     1, 1, 0, 0,
     {
-        { 7, 4, 13, 7 }, // Story        parry 11f / dodge 20f
-        { 5, 3,  9, 5 }, // Expeditioner parry  8f / dodge 14f (window counts incl. impact frame)
-        { 3, 2,  6, 3 }, // Expert       parry  5f / dodge  9f
+        { 7, 3, 13, 6 }, // Story        parry 11f / dodge 20f
+        { 5, 2,  9, 4 }, // Expeditioner parry  8f / dodge 14f
+        { 3, 1,  6, 2 }, // Expert       parry  5f / dodge  9f
+        // window = early + impact frame + late
     },
 };
 
@@ -149,6 +154,8 @@ struct ParryProc
     /* 63 */ u8 final_done;  // the final (real) generation pass has run
     /* 64 */ u16 saved_bldcnt;
     /* 66 */ u8 saved_coef_a, saved_coef_b, saved_y;
+    /* 69 */ u8 allow_tint;  // scene: colour pulses only for the verdict
+    /* 6A */ u16 zoom_clock; // keeps running after the last press for the zoom-out
 };
 
 enum
@@ -405,6 +412,14 @@ static void SetMapTint(int effect, int amount)
         return;
     }
 
+    if (sInScene())
+    {
+        struct ParryProc * proc = FindProc(ProcScr_ParryQte);
+
+        if (!proc->allow_tint)
+            return;
+    }
+
     SetBlendConfig(effect, 0, 0, amount);
 
     if (sInScene())
@@ -589,6 +604,354 @@ static bool sInScene(void)
     return proc != NULL && proc->in_scene;
 }
 
+
+// ---------------------------------------------------------------------------
+// battle-scene zoom
+//
+// While an enemy winds up, the battle scene gently scales up around its
+// centre. It reaches full size exactly when the dodge window opens, holds
+// there for the whole dodge window, then eases back. Fighters (sprites) are
+// scaled in both directions with affine sprites; the background and platform
+// (tile layers, which the GBA cannot scale) are stretched to match vertically,
+// line by line from the HBlank interrupt. The HUD is left untouched.
+
+#define ZOOM_MAX_EXTRA 16   // 16/256 = +6.25 % at full zoom
+#define ZOOM_CX 120
+#define ZOOM_CY 72
+#define ZOOM_HUD_Y 104      // sprites centred below this line are HUD
+#define ZOOM_DECAY 10
+#define ZOOM_MAGIC 0x5A4D
+#define ZOOM_LEAD 2         // frames between computing the zoom and the player's press being read
+#define ZOOM_AFFINE_BASE 28 // affine matrices 28..31 (plain, hflip, vflip, both)
+
+struct ZoomSt
+{
+    u16 magic;
+    u16 scale;     // 8.8 fixed point, 0x100 = 1.0
+    u16 inv;       // 8.8 fixed point, 0x10000 / scale
+    u16 base2;     // BG2/BG3 vertical offsets latched for the current frame
+    u16 base3;
+    u16 frame_scale; // scale/inverse latched at VBlank: what this frame displays
+    u16 frame_inv;
+    u16 pad;
+    struct ParryProc * proc;
+    Func prev_hblank;
+};
+
+// tail of the debug-text buffer, which retail play never uses
+#define sZoom ((struct ZoomSt volatile *) 0x02027B60)
+
+extern Func gOnHBlankB;
+
+static bool ZoomActive(void)
+{
+    struct ParryProc * proc;
+
+    if (sZoom->magic != ZOOM_MAGIC)
+        return FALSE;
+
+    proc = sZoom->proc;
+
+    if (proc == NULL || proc->proc_script != ProcScr_ParryQte || !proc->in_scene)
+        return FALSE;
+
+    return sZoom->frame_scale > 0x100;
+}
+
+static void ZoomHBlank(void)
+{
+    int n = REG_VCOUNT + 1;
+    int src;
+
+    if (n >= 228)
+        n = 0;
+
+    if (n >= DISPLAY_HEIGHT)
+        return;
+
+    src = ZOOM_CY + (((n - ZOOM_CY) * (int) sZoom->frame_inv) >> 8);
+
+    REG_BG2VOFS = sZoom->base2 + src - n;
+    REG_BG3VOFS = sZoom->base3 + src - n;
+}
+
+static void ZoomSetScale(int scale)
+{
+    sZoom->scale = scale;
+    sZoom->inv = 0x10000 / scale;
+}
+
+static void ZoomBegin(struct ParryProc * proc)
+{
+    sZoom->proc = proc;
+    sZoom->base2 = gDispIo.bg_off[2].y;
+    sZoom->base3 = gDispIo.bg_off[3].y;
+    ZoomSetScale(0x100);
+    sZoom->frame_scale = 0x100;
+    sZoom->frame_inv = 0x100;
+    sZoom->magic = ZOOM_MAGIC;
+
+    sZoom->prev_hblank = gOnHBlankB;
+    SetOnHBlankB(ZoomHBlank);
+}
+
+static void ZoomEnd(void)
+{
+    if (sZoom->magic != ZOOM_MAGIC)
+        return;
+
+    ZoomSetScale(0x100);
+    sZoom->frame_scale = 0x100;
+    sZoom->frame_inv = 0x100;
+    SetOnHBlankB(sZoom->prev_hblank);
+
+    sZoom->magic = 0;
+    sZoom->proc = NULL;
+}
+
+static CONST_DATA u8 sObjSizes[3][4][2] =
+{
+    { { 8, 8 }, { 16, 16 }, { 32, 32 }, { 64, 64 } }, // square
+    { { 16, 8 }, { 32, 8 }, { 32, 16 }, { 64, 32 } }, // wide
+    { { 8, 16 }, { 8, 32 }, { 16, 32 }, { 32, 64 } }, // tall
+};
+
+static void ZoomOam(u16 * buf, int count)
+{
+    int i, scale = sZoom->frame_scale;
+
+    for (i = 0; i < count; ++i, buf += 4)
+    {
+        int a0 = buf[0], a1 = buf[1];
+        int shape, size, w, h, x, y, cx, cy, mtx;
+
+        // skip hidden sprites and sprites that already use affine
+        if (a0 & 0x0300)
+            continue;
+
+        shape = (a0 >> 14) & 3;
+
+        if (shape == 3)
+            continue;
+
+        size = (a1 >> 14) & 3;
+        w = sObjSizes[shape][size][0];
+        h = sObjSizes[shape][size][1];
+
+        y = a0 & 0xFF;
+        if (y >= DISPLAY_HEIGHT)
+            y -= 0x100;
+
+        x = a1 & 0x1FF;
+        if (x >= 0x100)
+            x -= 0x200;
+
+        cy = y + h / 2;
+
+        if (cy >= ZOOM_HUD_Y)
+            continue;
+
+        cx = x + w / 2;
+
+        cx = ZOOM_CX + (((cx - ZOOM_CX) * scale) >> 8);
+        cy = ZOOM_CY + (((cy - ZOOM_CY) * scale) >> 8);
+
+        // double-size affine box: top-left is centre minus full size
+        x = cx - w;
+        y = cy - h;
+
+        mtx = ZOOM_AFFINE_BASE + ((a1 >> 12) & 1) + ((a1 >> 13) & 1) * 2;
+
+        buf[0] = (a0 & ~0x00FF) | 0x0300 | (y & 0xFF);
+        buf[1] = (a1 & 0xC000) | (mtx << 9) | (x & 0x1FF);
+    }
+}
+
+static void ZoomPutMatrices(void)
+{
+    int inv = sZoom->frame_inv;
+
+    SetObjAffine(ZOOM_AFFINE_BASE + 0,  inv, 0, 0,  inv);
+    SetObjAffine(ZOOM_AFFINE_BASE + 1, -inv, 0, 0,  inv);
+    SetObjAffine(ZOOM_AFFINE_BASE + 2,  inv, 0, 0, -inv);
+    SetObjAffine(ZOOM_AFFINE_BASE + 3, -inv, 0, 0, -inv);
+}
+
+struct OamSectionMirror
+{
+    u16 * buf;
+    void * oam;
+    u16 offset;
+    u16 count;
+};
+
+#define sOamHiSect ((struct OamSectionMirror *) 0x03000018)
+#define sOamLoSect ((struct OamSectionMirror *) 0x03000028)
+
+extern u16 * gOamHiPutIt;
+extern u16 * gOamLoPutIt;
+
+// hook: replaces SyncHiOam
+void ParrySyncHiOam(void)
+{
+    if (ZoomActive())
+    {
+        ZoomPutMatrices();
+        ZoomOam(sOamHiSect->buf, sOamHiSect->count);
+    }
+
+    CpuFastCopy(sOamHiSect->buf, sOamHiSect->oam, sOamHiSect->count * 8);
+    ClearOam(sOamHiSect->buf, sOamHiSect->count);
+
+    gOamHiPutIt = sOamHiSect->buf;
+
+    gOamAffinePutIt = (struct OamView *) gOam;
+    gOamAffinePutId = 0;
+}
+
+// hook: replaces SyncLoOam
+void ParrySyncLoOam(void)
+{
+    // OnVBlank calls this first; latch the zoom for the frame about to be shown
+    // so sprites (synced now) and tile layers (HBlank) always agree
+    if (sZoom->magic == ZOOM_MAGIC && gBmSt.main_loop_ended)
+    {
+        sZoom->frame_scale = sZoom->scale;
+        sZoom->frame_inv = sZoom->inv;
+        sZoom->base2 = gDispIo.bg_off[2].y;
+        sZoom->base3 = gDispIo.bg_off[3].y;
+    }
+
+    if (sOamLoSect->count == 0)
+        return;
+
+    if (ZoomActive())
+    {
+        ZoomPutMatrices();
+        ZoomOam(sOamLoSect->buf, sOamLoSect->count);
+    }
+
+    CpuFastCopy(sOamLoSect->buf, sOamLoSect->oam, sOamLoSect->count * 8);
+    ClearOam(sOamLoSect->buf, sOamLoSect->count);
+
+    gOamLoPutIt = sOamLoSect->buf;
+}
+
+// smoothstep on 0..256
+static int Smooth(int x)
+{
+    if (x <= 0)
+        return 0;
+
+    if (x >= 256)
+        return 256;
+
+    return (x * x * (3 * 256 - 2 * x)) >> 16;
+}
+
+// Zoom level (0..256) at pattern clock c. Full zoom == dodge window.
+static int ZoomLevel(struct ParryProc * proc, int c)
+{
+    struct ParryWindow const * win = &gParryConfig.windows[gParryConfig.difficulty < 3 ? gParryConfig.difficulty : 1];
+    struct PatternEv const * ev;
+    int best = 0, prev_b = -1, wind = -1, i;
+
+    for (i = 0; (ev = proc->pattern + i)->kind != EV_END; ++i)
+    {
+        int t = INTRO_FRAMES + ev->time;
+        int z = 0;
+
+        switch (ev->kind)
+        {
+
+        case EV_WIND:
+        case EV_SLOW:
+            wind = t;
+            break;
+
+        case EV_FAKE:
+            // feint: the zoom starts building, then backs off
+            if (c >= t && c < t + 16)
+                z = (Smooth(((c - t) * 256) / 16) * 150) >> 8;
+            else if (c >= t + 16 && c < t + 26)
+                z = (150 * (256 - Smooth(((c - t - 16) * 256) / 10))) >> 8;
+            break;
+
+        case EV_HIT:
+        {
+            int a = t - win->dodge_early;
+            int b = t + win->dodge_late;
+            struct PatternEv const * next;
+            bool decay;
+
+            if (c >= a && c <= b)
+            {
+                z = 256;
+            }
+            else if (c < a)
+            {
+                if (wind >= 0 && wind >= prev_b)
+                {
+                    // fresh wind-up: ease in from nothing
+                    if (c >= wind)
+                        z = (a > wind) ? Smooth(((c - wind) * 256) / (a - wind)) : 256;
+                }
+                else if (prev_b >= 0)
+                {
+                    // combo follow-up: dip to 30 % between blows
+                    if (c > prev_b)
+                    {
+                        int gap = a - prev_b;
+                        int d = gap > 0 ? ((c - prev_b) * 256) / gap : 256;
+                        int tri = 256 - (d * 2 - 256 < 0 ? 256 - d * 2 : d * 2 - 256);
+
+                        z = 256 - ((tri * 179) >> 8);
+                    }
+                }
+                else if (c >= t - 30)
+                {
+                    z = Smooth(((c - (t - 30)) * 256) / (a - (t - 30) > 0 ? a - (t - 30) : 1));
+                }
+            }
+            else
+            {
+                // after the window: ease out, unless a combo blow follows
+                next = ev + 1;
+                decay = TRUE;
+
+                if (next->kind == EV_HIT)
+                    decay = FALSE;
+
+                if (decay && c < b + ZOOM_DECAY)
+                    z = 256 - Smooth(((c - b) * 256) / ZOOM_DECAY);
+            }
+
+            prev_b = b;
+            break;
+        }
+
+        }
+
+        if (z > best)
+            best = z;
+    }
+
+    return best;
+}
+
+static void ZoomUpdate(struct ParryProc * proc)
+{
+    int level;
+
+    if (!proc->in_scene)
+        return;
+
+    level = ZoomLevel(proc, proc->zoom_clock + ZOOM_LEAD);
+    ZoomSetScale(0x100 + ((level * ZOOM_MAX_EXTRA) >> 8));
+
+    proc->zoom_clock++;
+}
+
 // Runs one frame of the timing challenge. Returns TRUE once the strike
 // (and its result display) is complete and the decision has been recorded.
 static bool QteStep(struct ParryProc * proc)
@@ -600,6 +963,8 @@ static bool QteStep(struct ParryProc * proc)
     {
         struct PatternEv const * ev;
         int hit;
+
+        ZoomUpdate(proc);
 
         // fire pattern events
         while (TRUE)
@@ -672,6 +1037,8 @@ static bool QteStep(struct ParryProc * proc)
     }
 
     case ST_RESULT:
+        ZoomUpdate(proc);
+
         if (proc->result_clock != 0)
         {
             proc->result_clock--;
@@ -679,6 +1046,8 @@ static bool QteStep(struct ParryProc * proc)
             // in battle: show the verdict as a short colour pulse
             if (proc->in_scene && proc->result_clock == 30)
             {
+                proc->allow_tint = TRUE;
+
                 if (proc->shown_res == RES_FAIL)
                     SetMapTint(BLEND_EFFECT_DARKEN, 8);
                 else
@@ -693,6 +1062,11 @@ static bool QteStep(struct ParryProc * proc)
 
         SetMapTint(BLEND_EFFECT_NONE, 0);
         ClearBanner();
+
+        if (proc->in_scene)
+            ZoomEnd();
+
+        proc->allow_tint = FALSE;
         return TRUE;
 
     }
@@ -703,9 +1077,13 @@ static bool QteStep(struct ParryProc * proc)
 static void BeginQte(struct ParryProc * proc, bool in_scene)
 {
     proc->in_scene = in_scene;
+    proc->allow_tint = FALSE;
+    proc->zoom_clock = 0;
 
     if (in_scene)
     {
+        ZoomBegin(proc);
+
         proc->saved_bldcnt = *((u16 *) &gDispIo.blend_ct);
         proc->saved_coef_a = gDispIo.blend_coef_a;
         proc->saved_coef_b = gDispIo.blend_coef_b;
@@ -787,6 +1165,9 @@ static void Parry_Loop(struct ParryProc * proc)
 
 static void Parry_OnEnd(struct ParryProc * proc)
 {
+    if (sZoom->magic == ZOOM_MAGIC && sZoom->proc == proc)
+        ZoomEnd();
+
     proc->generating = FALSE;
     proc->in_scene = FALSE;
 }
@@ -1117,4 +1498,13 @@ void ParryAiStartCombatAction(ProcPtr proc)
         BattleGenerateReal(gActiveUnit, target);
 
     SpawnProcLocking(ProcScr_CombatAction, proc);
+}
+
+// ---------------------------------------------------------------------------
+// hook: replaces ComputeBattleUnitEffectiveHitRate
+// Hit chance is gone: every blow lands unless it is parried or dodged.
+
+void ParryComputeBattleUnitEffectiveHitRate(struct BattleUnit * attacker, struct BattleUnit * defender)
+{
+    attacker->battle_effective_hit = 100;
 }

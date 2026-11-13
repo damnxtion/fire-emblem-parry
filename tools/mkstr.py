@@ -8,11 +8,11 @@ strs={
  'STR_BOSS':"Boss technique incoming!",
  'STR_KEYS':"A: Parry   B: Dodge",
  'STR_PARRY':"PARRY!",
- 'STR_RIPOSTE':"Riposte: next blow can't miss",
+ 'STR_RIPOSTE':"Riposte: next blow hits harder",
  'STR_DODGE':"DODGE!",
  'STR_DODGE2':"The attack misses",
  'STR_FAIL':"Too slow...",
- 'STR_FAIL2':"The enemy strikes normally",
+ 'STR_FAIL2':"The blow lands",
 }
 out=[]
 for k,v in strs.items():

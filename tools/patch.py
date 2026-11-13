@@ -26,6 +26,9 @@ hook('AiStartCombatAction','ParryAiStartCombatAction')
 hook('BeginBattleAnimations','ParryBeginBattleAnimations')
 hook('EkrBattleTriggerNewRoundStart','ParryEkrTriggerNewRoundStart')
 hook('EkrBattleInRound','ParryEkrBattleInRound')
+hook('SyncHiOam','ParrySyncHiOam')
+hook('SyncLoOam','ParrySyncLoOam')
+hook('ComputeBattleUnitEffectiveHitRate','ParryComputeBattleUnitEffectiveHitRate')
 # fix header checksum
 c=0
 for i in range(0xA0,0xBD): c=(c-b[i])&0xFF
