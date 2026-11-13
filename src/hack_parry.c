@@ -865,7 +865,11 @@ extern u16 * gOamHiPutIt;
 extern u16 * gOamLoPutIt;
 
 #define FX_PAL_ID 15
+static void LiveVBlankSample(void);
 static bool FxActive(void);
+static bool HudVisible(void);
+static bool FxGfxLoaded(void);
+static u16 const * HudBarTiles(void);
 static void FxPutOam(u16 * buf, int count);
 
 // hook: replaces SyncHiOam
@@ -877,16 +881,24 @@ void ParrySyncHiOam(void)
 
         // the scene restores palettes from its own copy (e.g. after the miss
         // flash): keep our effect palette in place while effects are shown
-        for (i = 0; i < 16; ++i)
-            ((u16 *) (PLTT + 0x200))[FX_PAL_ID * 16 + i] = gParryGfxPal[i];
+        if (((u16 *) (PLTT + 0x200))[FX_PAL_ID * 16 + 1] != gParryGfxPal[1]
+            || ((u16 *) (PLTT + 0x200))[FX_PAL_ID * 16 + 9] != gParryGfxPal[9])
+        {
+            for (i = 0; i < 16; ++i)
+                ((u16 *) (PLTT + 0x200))[FX_PAL_ID * 16 + i] = gParryGfxPal[i];
+        }
 
         // sprite-sheet uploads (ApplyDataMoves, just before this) can cover
         // the effect tiles: put them back every frame
-        for (i = 0; i < 10 * 16; ++i)
+        if (FxGfxLoaded())
         {
-            ((u16 *) (0x06010000 + (30 * 32 + 17) * 32))[i] = ((u16 const *) gParryGfxRow30)[i];
-            ((u16 *) (0x06010000 + (31 * 32 + 17) * 32))[i] = ((u16 const *) gParryGfxRow31)[i];
+            for (i = 0; i < 10 * 16; ++i)
+            {
+                ((u16 *) (0x06010000 + (30 * 32 + 17) * 32))[i] = ((u16 const *) gParryGfxRow30)[i];
+                ((u16 *) (0x06010000 + (31 * 32 + 17) * 32))[i] = ((u16 const *) gParryGfxRow31)[i];
+            }
         }
+
 
         FxPutOam(sOamHiSect->buf, sOamHiSect->count);
     }
@@ -909,6 +921,8 @@ void ParrySyncHiOam(void)
 // hook: replaces SyncLoOam
 void ParrySyncLoOam(void)
 {
+    LiveVBlankSample();
+
     // OnVBlank calls this first; latch the zoom for the frame about to be shown
     // so sprites (synced now) and tile layers (HBlank) always agree
     if (sZoom->magic == ZOOM_MAGIC && gBmSt.main_loop_ended)
@@ -1260,8 +1274,12 @@ static void Parry_Loop(struct ParryProc * proc)
     }
 }
 
+static void HudUnload(void);
+
 static void Parry_OnEnd(struct ParryProc * proc)
 {
+    HudUnload();
+
     if (sZoom->magic == ZOOM_MAGIC && sZoom->proc == proc)
         ZoomEnd();
 
@@ -1308,6 +1326,7 @@ static void StartParry(ProcPtr parent, struct Unit * instigator, struct Unit * t
 // hook: replaces BeginBattleAnimations
 
 static void LiveReset(void);
+static void HudLoad(void);
 
 void ParryBeginBattleAnimations(void)
 {
@@ -1326,6 +1345,7 @@ void ParryBeginBattleAnimations(void)
             proc->mode = MODE_SCENE;
             proc->in_scene = TRUE;
             LiveReset();
+            HudLoad();
         }
 
         SetBanimLinkArenaFlag(0);
@@ -1404,11 +1424,40 @@ struct LiveSt
     i8 dodge_dx;     // current dodge offset applied to the defender sprites
     i16 spark_x, spark_y;
     i16 text_x, text_y;
+    u8 hud_loaded;
+    i8 hud_e;        // frames until impact shown on the dev HUD (127 = none)
+    u8 hud_hold;
+    u8 last_res;     // last verdict shown on the dev HUD
+    i8 last_delta;   // frames from impact the press was made (+ early, - late)
+    u32 contact_time; // real-time clock (VBlank count) when contact was reached
+    u32 press_time;   // real-time clock of the frame the player saw when pressing
+    u8 press_kind;    // 0 none, 1 parry (A), 2 dodge (B)
+    u8 vb_prev;       // buttons seen at the previous VBlank
 };
 
 #define sLive ((struct LiveSt *) 0x02027600)
 #define sGfxSave ((u8 *) 0x02027700)   // 640 bytes of OBJ tiles
 #define sPalSave ((u16 *) 0x02027980)  // 16 colours
+#define sHudBar ((u16 *) 0x020279A0)   // 12 rendered timeline tiles (384 bytes)
+#define sHudPalSave ((u16 *) 0x02027B20)
+#define sHudOff (*(u8 *) 0x020276F0)   // SELECT toggles the dev HUD (kept until reset)
+#define sHudOam ((u16 *) 0x02027680)   // prebuilt HUD sprites, 16 x 3 halfwords
+#define sHudOamCount (*(u8 *) 0x020276E8)
+#define sHudKey (*(u32 *) 0x020276EC)
+
+#define HUD_TILE_BAR (28 * 32 + 16)
+#define HUD_TILE_MARK (28 * 32 + 28)
+#define HUD_TILE_F (28 * 32 + 29)
+#define HUD_TILE_MINUS (28 * 32 + 30)
+#define HUD_TILE_PLUS (28 * 32 + 31)
+#define HUD_TILE_DIGIT (29 * 32 + 16)
+#define HUD_TILE_P (29 * 32 + 26)
+#define HUD_TILE_D (29 * 32 + 27)
+#define HUD_TILE_X (29 * 32 + 28)
+#define HUD_TILE_H (29 * 32 + 29)
+#define HUD_X 72            // between the two name tags, above the fighters
+#define HUD_Y 1
+#define HUD_SPAN 36         // frames before impact shown on the timeline (2 px per frame)
 
 #define FX_PAL 15
 #define FX_TILE_ROW30 (30 * 32 + 17)
@@ -1437,6 +1486,11 @@ static void Copy16(void const * src, void * dst, int bytes)
 static u16 * ObjTile(int tile)
 {
     return (u16 *) (0x06010000 + tile * 32);
+}
+
+static struct ParryWindow const * CurWindowEarly(void)
+{
+    return &gParryConfig.windows[gParryConfig.difficulty < 3 ? gParryConfig.difficulty : 1];
 }
 
 static void FxLoadGfx(void)
@@ -1484,6 +1538,106 @@ static void FxRestoreGfx(void)
     }
 
     sLive->gfx_loaded = FALSE;
+}
+
+
+// ---------------------------------------------------------------------------
+// dev HUD: frame timeline shown at the top of the battle scene
+
+static void HudBuildBar(void)
+{
+    struct ParryWindow const * win = CurWindowEarly();
+    int x, y;
+
+    for (x = 0; x < 12 * 8; ++x)
+    {
+        int e = HUD_SPAN - x / 2;
+        int fill;
+
+        if (e <= win->parry_early && e >= -win->parry_late)
+            fill = 9;  // parry zone: yellow
+        else if (e <= win->dodge_early && e >= -win->dodge_late)
+            fill = 6;  // dodge zone: blue
+        else
+            fill = 7;  // grey
+
+        for (y = 0; y < 8; ++y)
+        {
+            int c = 0;
+
+            if (y == 1 || y == 6)
+                c = 4;
+            else if (y >= 2 && y <= 5)
+                c = fill;
+
+            if (e == 0 && (x & 1) == 0)
+                c = 1; // impact line
+
+            {
+                int tile = x / 8, px = x % 8;
+                u16 * w = sHudBar + tile * 16 + y * 2 + px / 4;
+                int shift = (px % 4) * 4;
+
+                *w = (*w & ~(0xF << shift)) | (c << shift);
+            }
+        }
+    }
+}
+
+static void HudUploadTiles(void)
+{
+    int i;
+
+    for (i = 0; i < 12 * 16; ++i)
+        ObjTile(HUD_TILE_BAR)[i] = sHudBar[i];
+
+    for (i = 0; i < 4 * 16; ++i)
+        ObjTile(HUD_TILE_MARK)[i] = ((u16 const *) gParryHud28)[i];
+
+    for (i = 0; i < 16 * 16; ++i)
+        ObjTile(HUD_TILE_DIGIT)[i] = ((u16 const *) gParryHud29)[i];
+}
+
+static void HudLoad(void)
+{
+    int i;
+
+    for (i = 0; i < 12 * 16; ++i)
+        sHudBar[i] = 0;
+
+    HudBuildBar();
+
+    for (i = 0; i < 16; ++i)
+        sHudPalSave[i] = ((u16 *) (PLTT + 0x200))[FX_PAL * 16 + i];
+
+    sHudKey = 0;
+    sHudOamCount = 0;
+    sLive->hud_e = 127;
+    sLive->last_res = RES_NONE;
+    sLive->hud_loaded = TRUE;
+}
+
+static void HudUnload(void)
+{
+    int i;
+
+    if (!sLive->hud_loaded)
+        return;
+
+    sLive->hud_loaded = FALSE;
+
+    for (i = 0; i < 16; ++i)
+    {
+        ((u16 *) (PLTT + 0x200))[FX_PAL * 16 + i] = sHudPalSave[i];
+        gPal[0x100 + FX_PAL * 16 + i] = sHudPalSave[i];
+    }
+
+    // these tiles are blank in battle; leave them blank
+    for (i = 0; i < 16 * 16; ++i)
+    {
+        ObjTile(HUD_TILE_BAR)[i] = 0;
+        ObjTile(29 * 32 + 16)[i] = 0;
+    }
 }
 
 static struct BaSprite * AtkAnim(int i) { return gAnims[sLive->side * 2 + i]; }
@@ -1703,14 +1857,14 @@ static void StartEffect(int kind)
         sLive->text_kind = FX_PARRY;
         sLive->text_t = 48;
         sLive->text_x = 120 - 24;
-        sLive->text_y = 18;
+        sLive->text_y = 26;
     }
     else
     {
         sLive->text_kind = FX_COUNTER;
         sLive->text_t = 48;
         sLive->text_x = 120 - 32;
-        sLive->text_y = 18;
+        sLive->text_y = 26;
     }
 }
 
@@ -1725,6 +1879,8 @@ static void LiveDecide(struct ParryProc * proc, int res)
         FlipToMiss();
 
     proc->results[proc->n_done++] = res;
+    sLive->last_res = res;
+    sLive->hud_e = 127;
 
     if (res == RES_PARRY)
     {
@@ -1751,7 +1907,7 @@ static void LiveStep(struct ParryProc * proc)
 {
     struct ParryWindow const * win = CurWindow();
     struct BaSprite * atk;
-    int f, e, seen, i;
+    int f, e, i;
 
     if (!sLive->armed || sLive->decided)
         return;
@@ -1782,7 +1938,10 @@ static void LiveStep(struct ParryProc * proc)
         f = FramesUntilContact(atk, FALSE);
 
         if (f < 0)
+        {
+            sLive->hud_e = 127;
             return; // not swinging yet
+        }
 
         // fast weapons: double-speed swing, but only until shortly before the
         // windows open, so the final approach runs frame by frame and every
@@ -1824,43 +1983,80 @@ static void LiveStep(struct ParryProc * proc)
             // the next sprite update would play the contact: hold it there
             // until the player has had the whole late part of the window
             sLive->stall = 1;
+            sLive->contact_time = GetGameTime();
             SetAtkFrozen(TRUE);
             e = 0;
         }
     }
 
-    // history of e, to judge presses against what was on screen
-    sLive->hist[3] = sLive->hist[2];
-    sLive->hist[2] = sLive->hist[1];
-    sLive->hist[1] = sLive->hist[0];
+    // latest frames-until-contact (also handy when debugging)
     sLive->hist[0] = e;
+    sLive->hist_n = 1;
 
-    if (sLive->hist_n < 4)
-        sLive->hist_n++;
+    sLive->hud_e = e > 99 ? 99 : e;
+    sLive->hud_hold = sLive->hold_active;
 
-    seen = sLive->hist_n > LIVE_SEEN_LAG ? sLive->hist[LIVE_SEEN_LAG] : e + LIVE_SEEN_LAG;
-
-    if (gKeySt->pressed & (KEY_BUTTON_A | KEY_BUTTON_B))
+    // Presses are judged in real time (VBlank count, which keeps running even
+    // when the game drops a frame) against the moment contact actually
+    // happens. A press before contact is remembered and judged once contact
+    // is reached; the swing is held at contact, so the verdict always comes
+    // before the blow resolves.
     {
-        bool parry = (gKeySt->pressed & KEY_BUTTON_A) != 0;
-        int early = parry ? win->parry_early : win->dodge_early;
-        int late = parry ? win->parry_late : win->dodge_late;
+        u32 now = GetGameTime();
+        int late_max = win->dodge_late > win->parry_late ? win->dodge_late : win->parry_late;
 
-        if (seen <= early && seen >= -late)
-            LiveDecide(proc, parry ? RES_PARRY : RES_DODGE);
-        else
+        if (!sLive->stall)
+            return; // contact not reached yet
+
+        if (sLive->press_kind != 0)
+        {
+            bool parry = sLive->press_kind == 1;
+            int early = parry ? win->parry_early : win->dodge_early;
+            int late = parry ? win->parry_late : win->dodge_late;
+            int delta = (int) (sLive->contact_time - sLive->press_time); // + early, - late
+
+            sLive->last_delta = delta < -99 ? -99 : (delta > 99 ? 99 : delta);
+
+            if (delta <= early && delta >= -late)
+                LiveDecide(proc, parry ? RES_PARRY : RES_DODGE);
+            else
+                LiveDecide(proc, RES_FAIL);
+
+            return;
+        }
+
+        // no press by the end of the late window: the blow lands
+        if ((int) ((now - LIVE_SEEN_LAG) - sLive->contact_time) > late_max)
+        {
+            sLive->last_delta = 127;
             LiveDecide(proc, RES_FAIL);
-
-        return;
+        }
     }
-
-    if (seen < -(int) (win->dodge_late > win->parry_late ? win->dodge_late : win->parry_late))
-        LiveDecide(proc, RES_FAIL);
 }
 
 // effects and zoom-out, every frame of the scene
+static void HudUpdate(void);
+
 static void LiveEffects(void)
 {
+    if (sLive->hud_loaded)
+    {
+        // the scene sets up its video memory after we start; (re)upload our
+        // HUD tiles whenever they are missing (one value checked per frame)
+        if (!sHudOff && ObjTile(HUD_TILE_MARK)[0] != ((u16 const *) gParryHud28)[0])
+            HudUploadTiles();
+
+        HudUpdate();
+    }
+
+    if (gKeySt->pressed & KEY_BUTTON_SELECT)
+    {
+        sHudOff ^= 1;
+
+        if (!sHudOff && sLive->hud_loaded)
+            HudUploadTiles();
+    }
+
     if (sLive->decay != 0)
     {
         int level = ((sLive->decay_from - 0x100) * Smooth((sLive->decay * 256) / LIVE_DECAY)) >> 8;
@@ -1926,13 +2122,118 @@ static void LiveEffects(void)
         FxRestoreGfx();
 }
 
-// Called from the VBlank OAM sync: put effect sprites in front of everything.
-static void FxPutOam(u16 * buf, int count)
+static bool HudVisible(void)
 {
-    u16 ents[4][3];
+    return sLive->hud_loaded && !sHudOff;
+}
+
+static void HudBuildOam(void)
+{
+    u16 ents[16][3];
     int n = 0, i;
 
-    if (sLive->spark_t != 0)
+    {
+        int e = sLive->hud_e;
+        int ty = HUD_Y + 9;
+
+        // marker first so it draws over the timeline
+        if (e != 127 && e <= HUD_SPAN)
+        {
+            int mx = HUD_X + (HUD_SPAN - (e < -11 ? -11 : e)) * 2;
+
+            ents[n][0] = HUD_Y & 0xFF;
+            ents[n][1] = mx & 0x1FF;
+            ents[n][2] = (FX_PAL << 12) | HUD_TILE_MARK;
+            n++;
+        }
+
+        // timeline: three 32x8 strips
+        for (i = 0; i < 3; ++i)
+        {
+            ents[n][0] = (1 << 14) | (HUD_Y & 0xFF);
+            ents[n][1] = (1 << 14) | ((HUD_X + i * 32) & 0x1FF);
+            ents[n][2] = (FX_PAL << 12) | (HUD_TILE_BAR + i * 4);
+            n++;
+        }
+
+        // frames until impact: "+12F" (H while the swing is held)
+        if (e != 127)
+        {
+            int v = e < 0 ? -e : e;
+
+            ents[n][0] = ty & 0xFF; ents[n][1] = HUD_X & 0x1FF;
+            ents[n][2] = (FX_PAL << 12) | (e < 0 ? HUD_TILE_MINUS : HUD_TILE_PLUS); n++;
+            ents[n][0] = ty & 0xFF; ents[n][1] = (HUD_X + 8) & 0x1FF;
+            ents[n][2] = (FX_PAL << 12) | (HUD_TILE_DIGIT + (v / 10) % 10); n++;
+            ents[n][0] = ty & 0xFF; ents[n][1] = (HUD_X + 16) & 0x1FF;
+            ents[n][2] = (FX_PAL << 12) | (HUD_TILE_DIGIT + v % 10); n++;
+            ents[n][0] = ty & 0xFF; ents[n][1] = (HUD_X + 24) & 0x1FF;
+            ents[n][2] = (FX_PAL << 12) | HUD_TILE_F; n++;
+
+            if (sLive->hud_hold)
+            {
+                ents[n][0] = ty & 0xFF; ents[n][1] = (HUD_X + 36) & 0x1FF;
+                ents[n][2] = (FX_PAL << 12) | HUD_TILE_H; n++;
+            }
+        }
+
+        // last verdict and how far from impact the press was: "P+2F"
+        if (sLive->last_res != RES_NONE)
+        {
+            int x = HUD_X + 64;
+            int letter = sLive->last_res == RES_PARRY ? HUD_TILE_P
+                : sLive->last_res == RES_DODGE ? HUD_TILE_D : HUD_TILE_X;
+
+            ents[n][0] = ty & 0xFF; ents[n][1] = x & 0x1FF;
+            ents[n][2] = (FX_PAL << 12) | letter; n++;
+
+            if (sLive->last_delta != 127)
+            {
+                int d = sLive->last_delta, v = d < 0 ? -d : d;
+
+                ents[n][0] = ty & 0xFF; ents[n][1] = (x + 8) & 0x1FF;
+                ents[n][2] = (FX_PAL << 12) | (d < 0 ? HUD_TILE_MINUS : HUD_TILE_PLUS); n++;
+                ents[n][0] = ty & 0xFF; ents[n][1] = (x + 16) & 0x1FF;
+                ents[n][2] = (FX_PAL << 12) | (HUD_TILE_DIGIT + (v > 9 ? 9 : v)); n++;
+                ents[n][0] = ty & 0xFF; ents[n][1] = (x + 24) & 0x1FF;
+                ents[n][2] = (FX_PAL << 12) | HUD_TILE_F; n++;
+            }
+        }
+    }
+
+    for (i = 0; i < n; ++i)
+    {
+        sHudOam[i * 3 + 0] = ents[i][0];
+        sHudOam[i * 3 + 1] = ents[i][1];
+        sHudOam[i * 3 + 2] = ents[i][2];
+    }
+
+    sHudOamCount = n;
+}
+
+// rebuild the HUD sprite list only when something shown on it changes
+static void HudUpdate(void)
+{
+    u32 key = ((u8) sLive->hud_e) | (sLive->hud_hold << 8) | (sLive->last_res << 9)
+        | (((u8) sLive->last_delta) << 12) | (1u << 31);
+
+    if (key == sHudKey)
+        return;
+
+    sHudKey = key;
+    HudBuildOam();
+}
+
+
+#define OAM_SQ8(x, y, tile) { (y) & 0xFF, (x) & 0x1FF, (FX_PAL << 12) | (tile) }
+
+// Called from the VBlank OAM sync: put effect and HUD sprites in front of everything.
+static void FxPutOam(u16 * buf, int count)
+{
+    u16 ents[24][3];
+    int n = 0, nfx, i, slot;
+
+    if (sLive->spark_t != 0 && sLive->gfx_loaded)
     {
         // 16x16 spark, affine double-size, growing then shrinking
         int t = sLive->spark_t;
@@ -1952,7 +2253,7 @@ static void FxPutOam(u16 * buf, int count)
         n++;
     }
 
-    if (sLive->text_t != 0)
+    if (sLive->text_t != 0 && sLive->gfx_loaded)
     {
         int tile = (sLive->text_kind == FX_PARRY) ? FX_TILE_ROW30 + 2 : FX_TILE_ROW31 + 2;
         int bob = sLive->text_t > 40 ? (sLive->text_t - 40) : 0;
@@ -1966,18 +2267,54 @@ static void FxPutOam(u16 * buf, int count)
         }
     }
 
-    if (n == 0 || count <= n)
-        return;
+    nfx = n;
 
-    // make room at the front (front entries are drawn on top)
-    for (i = count - 1; i >= n; --i)
+    if (HudVisible())
     {
-        buf[i * 4 + 0] = buf[(i - n) * 4 + 0];
-        buf[i * 4 + 1] = buf[(i - n) * 4 + 1];
-        buf[i * 4 + 2] = buf[(i - n) * 4 + 2];
+        int k;
+
+        for (k = 0; k < sHudOamCount && n < 24; ++k)
+        {
+            ents[n][0] = sHudOam[k * 3 + 0];
+            ents[n][1] = sHudOam[k * 3 + 1];
+            ents[n][2] = sHudOam[k * 3 + 2];
+            n++;
+        }
     }
 
-    for (i = 0; i < n; ++i)
+    // HUD sprites never overlap anything: put them in unused (hidden) slots
+    // at the end of the buffer, which costs nothing to move
+    slot = count - 1;
+
+    for (i = nfx; i < n; ++i)
+    {
+        // unused slots are parked off-screen at y=160 (or hidden)
+        while (slot >= 0 && (buf[slot * 4] & 0x0300) != 0x0200
+            && !((buf[slot * 4] & 0x01FF) == 0x00A0))
+            slot--;
+
+        if (slot < 0)
+            break;
+
+        buf[slot * 4 + 0] = ents[i][0];
+        buf[slot * 4 + 1] = ents[i][1];
+        buf[slot * 4 + 2] = ents[i][2];
+        slot--;
+    }
+
+    if (nfx == 0 || count <= nfx)
+        return;
+
+    // effects go in front (front entries are drawn on top); they only exist
+    // for a moment after a parry
+    for (i = count - 1; i >= nfx; --i)
+    {
+        buf[i * 4 + 0] = buf[(i - nfx) * 4 + 0];
+        buf[i * 4 + 1] = buf[(i - nfx) * 4 + 1];
+        buf[i * 4 + 2] = buf[(i - nfx) * 4 + 2];
+    }
+
+    for (i = 0; i < nfx; ++i)
     {
         buf[i * 4 + 0] = ents[i][0];
         buf[i * 4 + 1] = ents[i][1];
@@ -1985,9 +2322,44 @@ static void FxPutOam(u16 * buf, int count)
     }
 }
 
+// Sample A/B at every VBlank (60 Hz, even when the game drops a frame) so
+// each press gets an exact time stamp.
+static void LiveVBlankSample(void)
+{
+    int keys;
+
+    if (!sLive->armed || sLive->decided)
+        return;
+
+    keys = (~REG_KEYINPUT) & (KEY_BUTTON_A | KEY_BUTTON_B);
+
+    if (sLive->press_kind == 0)
+    {
+        int fresh = keys & ~sLive->vb_prev;
+
+        if (fresh)
+        {
+            sLive->press_kind = (fresh & KEY_BUTTON_A) ? 1 : 2;
+            sLive->press_time = GetGameTime() - LIVE_SEEN_LAG; // the frame on screen when pressed
+        }
+    }
+
+    sLive->vb_prev = keys;
+}
+
+static bool FxGfxLoaded(void)
+{
+    return sLive->gfx_loaded;
+}
+
+static u16 const * HudBarTiles(void)
+{
+    return sHudBar;
+}
+
 static bool FxActive(void)
 {
-    return sLive->gfx_loaded && (sLive->spark_t != 0 || sLive->text_t != 0);
+    return (sLive->gfx_loaded && (sLive->spark_t != 0 || sLive->text_t != 0)) || HudVisible();
 }
 
 // Keep only hits [shown, end) of the latest generation in gBattleHits and
@@ -2014,6 +2386,8 @@ static void PrepareSegment(struct ParryProc * proc)
     sLive->round = n - 1;
     sLive->stall = 0;
     sLive->hist_n = 0;
+    sLive->press_kind = 0;
+    sLive->vb_prev = KEY_BUTTON_A | KEY_BUTTON_B; // a button already held does not count
     sLive->hold_active = FALSE;
 
     if (proc->pending)
@@ -2211,6 +2585,7 @@ void ParryEkrBattleInRound(struct ProcEkrBattle * proc)
         sLive->text_t = 0;
         sLive->spark_t = 0;
         FxRestoreGfx();
+        HudUnload();
     }
 
     if (ret == 1)

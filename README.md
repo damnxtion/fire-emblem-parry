@@ -16,6 +16,18 @@ A real-time dodge/parry battle system for FE6 (Japanese ROM `AFEJ` with the Engl
   with the weapon's rank (E to S): 42 styles in all.
 - With battle animations off, the challenge plays on the map with a text box instead.
 
+## Timing overlay (dev tool)
+
+A small overlay sits in the strip of sky between the two name tags at the top of the battle scene,
+clear of the fighters. Press **SELECT** during a battle to hide or show it.
+
+- **Timeline:** grey run-up, blue dodge zone, yellow parry zone and a white impact line, at 2 pixels per
+  frame. A white marker slides along it during the enemy's swing and crosses the impact line on the
+  frame the weapon lands.
+- **Countdown:** frames until impact, e.g. `+12F`, with an orange `H` while the swing is held mid-way.
+- **Last verdict:** `P` parry, `D` dodge, `X` failed, followed by how far from impact you pressed
+  (`+2F` = 2 frames early, `-3F` = 3 frames late; no number means no press).
+
 ## Swing styles
 
 | Weapon | Style | How rank changes it |
@@ -39,8 +51,9 @@ impact always runs frame by frame, so every frame of the windows exists.
 | Expeditioner | 9 frames (0.15 s) | 17 frames |
 | Expert | 9 frames (0.15 s) | 15 frames |
 
-Presses are judged against what was on screen when you pressed. If the game itself drops a frame at
-impact (as the original game does on some hits), that frame can stretch a window by 1/60 s. The
+Buttons are sampled at every VBlank (60 times a second, even when the game drops a frame) and each
+press is judged in real time against the frame contact actually happens, using what was on screen
+when you pressed. So the windows are exactly 9 and 15 frames regardless of slowdown. The
 counterattack after a parry is only added when the battle record (7 blows) has room for it.
 
 ## Applying
